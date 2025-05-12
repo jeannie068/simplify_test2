@@ -49,6 +49,8 @@ private:
     void updateContourWithModule(const shared_ptr<Module>& module);
     void packNode(const shared_ptr<BStarTreeNode>& node);
     void calculateSymmetricModulePositions();
+    // New function to calculate the optimal symmetry axis position
+    void calculateSymmetryAxis();
     
 public:
     /**

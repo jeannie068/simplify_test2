@@ -206,40 +206,87 @@ void ASFBStarTree::packNode(const shared_ptr<BStarTreeNode>& node) {
  * Calculate the positions of symmetric modules
  */
 void ASFBStarTree::calculateSymmetricModulePositions() {
+    // Get the exact symmetry axis position for precise calculations
+    double axis = symmetryAxisPosition;
+    
     // Process symmetry pairs
     for (const auto& pair : symmetryGroup->getSymmetryPairs()) {
         const string& module1 = pair.first;
         const string& module2 = pair.second;
         
-        // If module2 is the representative, calculate the position of module1
-        if (representativeMap[module1] == module2) {
-            auto mod1 = modules[module1];
-            auto mod2 = modules[module2];
+        // Find modules in our module map
+        auto it1 = modules.find(module1);
+        auto it2 = modules.find(module2);
+        
+        if (it1 == modules.end() || it2 == modules.end()) {
+            continue;  // Skip if either module not found
+        }
+        
+        auto mod1 = it1->second;
+        auto mod2 = it2->second;
+        
+        // Ensure both modules have the same dimensions (critical for symmetry)
+        // If rotations are different, synchronize them
+        if (mod1->getRotated() != mod2->getRotated()) {
+            mod2->setRotation(mod1->getRotated());
+        }
+        
+        // Identify which module is the representative
+        bool mod1IsRep = (representativeMap[module1] == module1);
+        bool mod2IsRep = (representativeMap[module2] == module2);
+        
+        // If both or none are representatives, use module2 as representative
+        shared_ptr<Module> rep, sym;
+        if (mod1IsRep && !mod2IsRep) {
+            rep = mod1;
+            sym = mod2;
+        } else {
+            rep = mod2;
+            sym = mod1;
+        }
+        
+        if (symmetryGroup->getType() == SymmetryType::VERTICAL) {
+            // For vertical symmetry: x1 + x2 = 2*axis, y1 = y2
             
-            if (mod1 && mod2) {
-                if (symmetryGroup->getType() == SymmetryType::VERTICAL) {
-                    // For vertical symmetry, reflect x-coordinate about the symmetry axis
-                    int reflectedX = 2 * static_cast<int>(symmetryAxisPosition) - (mod2->getX() + mod2->getWidth());
-                    mod1->setPosition(reflectedX, mod2->getY());
-                } else {
-                    // For horizontal symmetry, reflect y-coordinate about the symmetry axis
-                    int reflectedY = 2 * static_cast<int>(symmetryAxisPosition) - (mod2->getY() + mod2->getHeight());
-                    mod1->setPosition(mod2->getX(), reflectedY);
-                }
-            }
+            // Calculate center of representative module
+            double repCenterX = rep->getX() + rep->getWidth() / 2.0;
+            
+            // Calculate position of symmetric module using the axis
+            double symCenterX = 2 * axis - repCenterX;
+            int symX = static_cast<int>(symCenterX - sym->getWidth() / 2.0);
+            
+            // Ensure exact y-coordinate equality
+            sym->setPosition(symX, rep->getY());
+        } else {
+            // For horizontal symmetry: y1 + y2 = 2*axis, x1 = x2
+            
+            // Calculate center of representative module
+            double repCenterY = rep->getY() + rep->getHeight() / 2.0;
+            
+            // Calculate position of symmetric module using the axis
+            double symCenterY = 2 * axis - repCenterY;
+            int symY = static_cast<int>(symCenterY - sym->getHeight() / 2.0);
+            
+            // Ensure exact x-coordinate equality
+            sym->setPosition(rep->getX(), symY);
         }
     }
     
     // Process self-symmetric modules
     for (const auto& moduleName : selfSymmetricModules) {
-        auto module = modules[moduleName];
-        if (module) {
-            // For self-symmetric modules, make sure they are centered on the symmetry axis
-            if (symmetryGroup->getType() == SymmetryType::VERTICAL) {
-                module->setPosition(static_cast<int>(symmetryAxisPosition) - module->getWidth() / 2, module->getY());
-            } else {
-                module->setPosition(module->getX(), static_cast<int>(symmetryAxisPosition) - module->getHeight() / 2);
-            }
+        auto it = modules.find(moduleName);
+        if (it == modules.end()) continue;
+        
+        auto module = it->second;
+        
+        if (symmetryGroup->getType() == SymmetryType::VERTICAL) {
+            // For vertical symmetry, center the module on the axis
+            int x = static_cast<int>(axis - module->getWidth() / 2.0);
+            module->setPosition(x, module->getY());
+        } else {
+            // For horizontal symmetry, center the module on the axis
+            int y = static_cast<int>(axis - module->getHeight() / 2.0);
+            module->setPosition(module->getX(), y);
         }
     }
 }
@@ -251,53 +298,41 @@ void ASFBStarTree::calculateSymmetricModulePositions() {
 bool ASFBStarTree::pack() {
     if (!root) return false;
     
-    // Initialize contours
+    // Initialize contours and clear any previous placement data
     initializeContours();
     
-    // Set the symmetry axis position based on the tree structure
-    // For simplicity, we'll place it at the rightmost position of the modules
-    int maxX = 0, maxY = 0;
-    
-    // Traverse the tree in pre-order and pack each node
+    // Use a more robust pre-order traversal for packing
+    vector<shared_ptr<BStarTreeNode>> traversalOrder;
     queue<shared_ptr<BStarTreeNode>> nodeQueue;
     nodeQueue.push(root);
     
     while (!nodeQueue.empty()) {
-        auto currentNode = nodeQueue.front();
+        auto current = nodeQueue.front();
         nodeQueue.pop();
         
-        if (!currentNode) continue;
+        if (!current) continue;
         
-        // Pack the current node
-        packNode(currentNode);
+        // Add to traversal order
+        traversalOrder.push_back(current);
         
-        // Update maximum coordinates
-        auto module = modules[currentNode->getModuleName()];
-        if (module) {
-            maxX = max(maxX, module->getX() + module->getWidth());
-            maxY = max(maxY, module->getY() + module->getHeight());
-        }
-        
-        // Add children to the queue
-        if (currentNode->getLeftChild()) {
-            nodeQueue.push(currentNode->getLeftChild());
-        }
-        if (currentNode->getRightChild()) {
-            nodeQueue.push(currentNode->getRightChild());
-        }
+        // Add children to queue (right child first for pre-order DFS)
+        if (current->getRightChild()) nodeQueue.push(current->getRightChild());
+        if (current->getLeftChild()) nodeQueue.push(current->getLeftChild());
     }
     
-    // Set the symmetry axis position
-    if (symmetryGroup->getType() == SymmetryType::VERTICAL) {
-        symmetryAxisPosition = maxX;  // Place the symmetry axis at the rightmost point
-    } else {
-        symmetryAxisPosition = maxY;  // Place the symmetry axis at the topmost point
+    // Pack nodes in traversal order
+    for (const auto& node : traversalOrder) {
+        packNode(node);
     }
     
-    // Calculate positions for symmetric modules
+    // Calculate the symmetry axis position
+    calculateSymmetryAxis();
+    
+    // Update positions of symmetric modules
     calculateSymmetricModulePositions();
     
-    return true;
+    // Validate the placement
+    return validateSymmetryConstraints();
 }
 
 /**
@@ -377,6 +412,49 @@ bool ASFBStarTree::validateSymmetryConstraints() const {
     }
     
     return true;
+}
+
+// New function to calculate the optimal symmetry axis position
+void ASFBStarTree::calculateSymmetryAxis() {
+    // We need to calculate the axis position based on the placed modules
+    
+    // For empty tree, use default position
+    if (!root) {
+        symmetryAxisPosition = 0.0;
+        return;
+    }
+    
+    // Track module position extents
+    int minX = std::numeric_limits<int>::max();
+    int maxX = std::numeric_limits<int>::min();
+    int minY = std::numeric_limits<int>::max();
+    int maxY = std::numeric_limits<int>::min();
+    
+    // Find the bounding box of all representative modules
+    for (const auto& pair : modules) {
+        const auto& moduleName = pair.first;
+        const auto& module = pair.second;
+        
+        // Only consider representative modules
+        if (!isRepresentative(moduleName)) continue;
+        
+        minX = std::min(minX, module->getX());
+        maxX = std::max(maxX, module->getX() + module->getWidth());
+        minY = std::min(minY, module->getY());
+        maxY = std::max(maxY, module->getY() + module->getHeight());
+    }
+    
+    // Set symmetry axis position based on the bounding box
+    if (symmetryGroup->getType() == SymmetryType::VERTICAL) {
+        // For vertical symmetry, position axis at the right edge of the bounding box
+        symmetryAxisPosition = maxX;
+    } else { // HORIZONTAL
+        // For horizontal symmetry, position axis at the top edge of the bounding box
+        symmetryAxisPosition = maxY;
+    }
+    
+    // Update the symmetry group's axis position
+    symmetryGroup->setAxisPosition(symmetryAxisPosition);
 }
 
 /**
@@ -609,25 +687,36 @@ bool ASFBStarTree::rotateModule(const string& moduleName) {
     
     auto module = it->second;
     
-    // Special handling for symmetry pairs and self-symmetric modules
-    auto pairIt = symmetricPairMap.find(moduleName);
-    auto selfIt = find(selfSymmetricModules.begin(), selfSymmetricModules.end(), moduleName);
+    // Check if this module is part of a symmetry pair
+    string pairModuleName;
+    bool isInPair = false;
     
-    if (pairIt != symmetricPairMap.end()) {
-        // For symmetry pairs, rotate both modules
-        auto pairModule = modules[pairIt->second];
-        if (pairModule) {
-            pairModule->rotate();
+    for (const auto& pair : symmetryGroup->getSymmetryPairs()) {
+        if (pair.first == moduleName) {
+            pairModuleName = pair.second;
+            isInPair = true;
+            break;
+        } else if (pair.second == moduleName) {
+            pairModuleName = pair.first;
+            isInPair = true;
+            break;
         }
-    } else if (selfIt != selfSymmetricModules.end()) {
-        // For self-symmetric modules, update the shape of its representative
-        // This is a simplification - in reality, more complex handling might be needed
     }
     
-    // Rotate the module
+    // For modules in symmetry pairs, rotate both modules
+    if (isInPair) {
+        auto pairIt = modules.find(pairModuleName);
+        if (pairIt != modules.end()) {
+            // Ensure both modules rotate together
+            pairIt->second->rotate();
+        }
+    }
+    
+    // Always rotate the requested module
     module->rotate();
     
-    return true;
+    // Repack to ensure symmetry
+    return pack();
 }
 
 /**

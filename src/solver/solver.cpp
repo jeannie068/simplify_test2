@@ -168,216 +168,69 @@ void PlacementSolver::createInitialSolution() {
 }
 
 bool PlacementSolver::packSolution() {
-    // Pack all symmetry islands first, and arrange them in a grid-like pattern
-    std::vector<std::pair<std::shared_ptr<SymmetryGroup>, std::pair<int, int>>> groupSizes;
+    // Start with empty placement
+    int currentY = 0;
     
-    // First, pack each symmetry island in place (0, 0) to get their dimensions
+    // First, pack all symmetry groups as individual entities
     for (auto& pair : symmetryTrees) {
-        // Pack the symmetry island
-        if (!pair.second->pack()) {
+        auto& symGroup = pair.second;
+        
+        // Pack the symmetry island to get its bounding dimensions
+        if (!symGroup->pack()) {
             std::cerr << "Failed to pack symmetry group: " << pair.first << std::endl;
             return false;
         }
         
-        // Calculate bounding box of the symmetry island
+        // Get bounding dimensions of this symmetry group
         int minX = std::numeric_limits<int>::max();
         int minY = std::numeric_limits<int>::max();
         int maxX = 0;
         int maxY = 0;
         
-        for (const auto& modulePair : pair.second->getModules()) {
-            const auto& module = modulePair.second;
-            
+        for (const auto& modulePair : symGroup->getModules()) {
+            auto module = modulePair.second;
             minX = std::min(minX, module->getX());
             minY = std::min(minY, module->getY());
             maxX = std::max(maxX, module->getX() + module->getWidth());
             maxY = std::max(maxY, module->getY() + module->getHeight());
         }
         
-        // Store group and its dimensions
-        int width = maxX - minX;
-        int height = maxY - minY;
-        groupSizes.push_back({pair.second->getSymmetryGroup(), {width, height}});
-        
-        // Shift all modules to have their lower-left corner at (0, 0)
-        for (auto& modulePair : pair.second->getModules()) {
-            auto module = modulePair.second;
-            module->setPosition(module->getX() - minX, module->getY() - minY);
-        }
+        // Shift symmetry island to position (0, currentY)
+        int deltaX = -minX;
+        int deltaY = currentY - minY;
         
         // Update symmetry axis position
-        if (pair.second->getSymmetryGroup()->getType() == SymmetryType::VERTICAL) {
-            double oldAxis = pair.second->getSymmetryAxisPosition();
-            pair.second->getSymmetryGroup()->setAxisPosition(oldAxis - minX);
-        } else { // HORIZONTAL
-            double oldAxis = pair.second->getSymmetryAxisPosition();
-            pair.second->getSymmetryGroup()->setAxisPosition(oldAxis - minY);
-        }
-    }
-    
-    // Sort symmetry groups by area (largest first)
-    std::sort(groupSizes.begin(), groupSizes.end(),
-             [](const auto& a, const auto& b) {
-                 return a.second.first * a.second.second > b.second.first * b.second.second;
-             });
-    
-    // Grid-based placement of symmetry islands
-    // Determine grid size based on number of symmetry groups
-    int numGroups = groupSizes.size();
-    int gridSize = std::ceil(std::sqrt(numGroups));
-    
-    // Place symmetry islands in a grid, trying to minimize total area
-    int gridWidth = 0;
-    int gridHeight = 0;
-    
-    // Track available positions for regular modules
-    std::vector<std::pair<int, int>> availablePositions;
-    
-    // Special case handling for single symmetry group
-    if (numGroups == 1) {
-        auto& groupSize = groupSizes[0];
-        auto& symGroup = groupSize.first;
-        int width = groupSize.second.first;
-        int height = groupSize.second.second;
-        
-        // Shift all modules in this group to (0, 0)
-        auto& tree = symmetryTrees[symGroup->getName()];
-        
-        // Update grid dimensions
-        gridWidth = width;
-        gridHeight = height;
-        
-        // Add position to the right of this group for regular modules
-        availablePositions.push_back({width, 0});
-    } 
-    else {
-        // For multiple groups, try to optimize placement
-        std::vector<std::vector<bool>> gridOccupied(gridSize, std::vector<bool>(gridSize, false));
-        std::vector<std::vector<std::pair<int, int>>> gridBounds(gridSize, std::vector<std::pair<int, int>>(gridSize, {0, 0}));
-        
-        for (int i = 0; i < numGroups; ++i) {
-            auto& groupSize = groupSizes[i];
-            auto& symGroup = groupSize.first;
-            int width = groupSize.second.first;
-            int height = groupSize.second.second;
-            
-            // Find best position in grid
-            int bestRow = 0;
-            int bestCol = 0;
-            int bestWastedSpace = std::numeric_limits<int>::max();
-            
-            for (int row = 0; row < gridSize; ++row) {
-                for (int col = 0; col < gridSize; ++col) {
-                    if (!gridOccupied[row][col]) {
-                        // Calculate wasted space if we place the group here
-                        int rowHeight = 0;
-                        int colWidth = 0;
-                        
-                        // Calculate max height in this row and max width in this column
-                        for (int r = 0; r < gridSize; ++r) {
-                            if (gridOccupied[r][col]) {
-                                colWidth = std::max(colWidth, gridBounds[r][col].first);
-                            }
-                        }
-                        
-                        for (int c = 0; c < gridSize; ++c) {
-                            if (gridOccupied[row][c]) {
-                                rowHeight = std::max(rowHeight, gridBounds[row][c].second);
-                            }
-                        }
-                        
-                        // Calculate wasted space
-                        int wastedSpace = 0;
-                        if (colWidth > 0 && width > colWidth) {
-                            wastedSpace += (width - colWidth) * rowHeight;
-                        }
-                        if (rowHeight > 0 && height > rowHeight) {
-                            wastedSpace += (height - rowHeight) * colWidth;
-                        }
-                        
-                        // Update best position
-                        if (wastedSpace < bestWastedSpace) {
-                            bestWastedSpace = wastedSpace;
-                            bestRow = row;
-                            bestCol = col;
-                        }
-                    }
-                }
-            }
-            
-            // Place group at best position
-            gridOccupied[bestRow][bestCol] = true;
-            gridBounds[bestRow][bestCol] = {width, height};
-            
-            // Calculate position for this group
-            int posX = 0;
-            int posY = 0;
-            
-            for (int c = 0; c < bestCol; ++c) {
-                int maxWidth = 0;
-                for (int r = 0; r < gridSize; ++r) {
-                    if (gridOccupied[r][c]) {
-                        maxWidth = std::max(maxWidth, gridBounds[r][c].first);
-                    }
-                }
-                posX += maxWidth;
-            }
-            
-            for (int r = 0; r < bestRow; ++r) {
-                int maxHeight = 0;
-                for (int c = 0; c < gridSize; ++c) {
-                    if (gridOccupied[r][c]) {
-                        maxHeight = std::max(maxHeight, gridBounds[r][c].second);
-                    }
-                }
-                posY += maxHeight;
-            }
-            
-            // Shift all modules in this group to (posX, posY)
-            auto& tree = symmetryTrees[symGroup->getName()];
-            for (auto& modulePair : tree->getModules()) {
-                auto module = modulePair.second;
-                module->setPosition(module->getX() + posX, module->getY() + posY);
-            }
-            
-            // Update symmetry axis position
-            if (tree->getSymmetryGroup()->getType() == SymmetryType::VERTICAL) {
-                double oldAxis = tree->getSymmetryAxisPosition();
-                tree->getSymmetryGroup()->setAxisPosition(oldAxis + posX);
-            } else { // HORIZONTAL
-                double oldAxis = tree->getSymmetryAxisPosition();
-                tree->getSymmetryGroup()->setAxisPosition(oldAxis + posY);
-            }
-            
-            // Update grid dimensions
-            gridWidth = std::max(gridWidth, posX + width);
-            gridHeight = std::max(gridHeight, posY + height);
-            
-            // Add position to available positions for regular modules
-            availablePositions.push_back({posX + width, posY});
+        if (symGroup->getSymmetryGroup()->getType() == SymmetryType::VERTICAL) {
+            double oldAxis = symGroup->getSymmetryAxisPosition();
+            symGroup->getSymmetryGroup()->setAxisPosition(oldAxis + deltaX);
+        } else {
+            double oldAxis = symGroup->getSymmetryAxisPosition();
+            symGroup->getSymmetryGroup()->setAxisPosition(oldAxis + deltaY);
         }
         
-        // Add position at the bottom-right corner of the grid
-        availablePositions.push_back({gridWidth, gridHeight});
-    }
-    
-    // Then, pack regular modules at available positions
-    if (regularTree && !regularModules.empty()) {
-        if (!packRegularModules(availablePositions)) {
-            std::cerr << "Failed to pack regular modules" << std::endl;
-            return false;
+        // Shift all modules in the symmetry island
+        for (const auto& modulePair : symGroup->getModules()) {
+            auto module = modulePair.second;
+            module->setPosition(module->getX() + deltaX, module->getY() + deltaY);
         }
+        
+        // Update current Y for next group with some spacing
+        currentY = maxY - minY + currentY + 10; // 10 units of spacing between groups
     }
     
-    // Validate symmetry constraints
-    if (!validateSymmetryConstraints()) {
-        std::cerr << "Symmetry constraints violated" << std::endl;
+    // Now handle regular modules using B*-tree
+    if (!regularModules.empty() && regularTree) {
+        packRegularModules({{0, currentY}});
+    }
+    
+    // Final validation
+    if (hasOverlaps()) {
+        std::cerr << "Placement has overlapping modules" << std::endl;
         return false;
     }
     
-    // Check for overlaps
-    if (hasOverlaps()) {
-        std::cerr << "Placement has overlapping modules" << std::endl;
+    if (!validateSymmetryConstraints()) {
+        std::cerr << "Symmetry constraints violated" << std::endl;
         return false;
     }
     

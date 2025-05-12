@@ -372,45 +372,48 @@ bool SimulatedAnnealing::perturb() {
     // Save current state before perturbation
     saveCurrentState();
     
-    // Choose perturbation type
+    // Choose perturbation type - only use rotation, pre-order, and in-order
     double randVal = uniformDist(rng);
     bool success = false;
     
-    if (randVal < probRotate) {
+    if (randVal < 0.3) {
+        // Rotation perturbation (30% probability)
         success = perturbRotate();
         if (success) lastPerturbation = PerturbationType::ROTATE;
     } 
-    else if (randVal < probRotate + probMove) {
-        success = perturbMove();
-        if (success) lastPerturbation = PerturbationType::MOVE;
-    } 
-    else if (randVal < probRotate + probMove + probSwap) {
-        success = perturbSwap();
-        if (success) lastPerturbation = PerturbationType::SWAP;
-    } 
-    else if (randVal < probRotate + probMove + probSwap + probChangeRep) {
-        success = perturbChangeRepresentative();
-        if (success) lastPerturbation = PerturbationType::CHANGE_REP;
+    else if (randVal < 0.65) {
+        // Pre-order traversal based perturbation (35% probability)
+        success = perturbPreOrder();
+        if (success) lastPerturbation = PerturbationType::PRE_ORDER;
     } 
     else {
-        success = perturbConvertSymmetryType();
-        if (success) lastPerturbation = PerturbationType::CONVERT_SYM;
+        // In-order traversal based perturbation (35% probability)
+        success = perturbInOrder();
+        if (success) lastPerturbation = PerturbationType::IN_ORDER;
     }
     
-    return success;
+    if (success) {
+        // After perturbation, pack the solution to ensure validity
+        return packSolution();
+    }
+    
+    return false;
 }
 
+/**
+ * Rotation perturbation - rotates a module or a symmetric pair
+ */
 bool SimulatedAnnealing::perturbRotate() {
-    if (regularModules.empty() && symmetryTrees.empty()) {
-        return false;
-    }
+    // First decide whether to perturb a regular module or a symmetry group
+    bool perturbRegular = !regularModules.empty() && 
+                         (symmetryTrees.empty() || uniformDist(rng) < 0.5);
     
-    // Decide whether to rotate a regular module or a module in a symmetry group
-    if (!regularModules.empty() && (symmetryTrees.empty() || uniformDist(rng) < 0.5)) {
-        // Rotate a regular module
+    if (perturbRegular) {
+        // Select a random regular module
         int index = static_cast<int>(uniformDist(rng) * regularModules.size());
         auto it = regularModules.begin();
         std::advance(it, index);
+        
         perturbedModule1 = it->first;
         
         // Rotate the module
@@ -418,14 +421,16 @@ bool SimulatedAnnealing::perturbRotate() {
         return true;
     } 
     else if (!symmetryTrees.empty()) {
-        // Rotate a module in a symmetry group
+        // Select a random symmetry group
         int index = static_cast<int>(uniformDist(rng) * symmetryTrees.size());
         auto it = symmetryTrees.begin();
         std::advance(it, index);
+        
         perturbedSymGroup = it->first;
+        auto asfTree = it->second;
         
         // Get a random module from the symmetry group
-        auto& modules = it->second->getModules();
+        auto& modules = asfTree->getModules();
         if (modules.empty()) {
             return false;
         }
@@ -433,32 +438,288 @@ bool SimulatedAnnealing::perturbRotate() {
         int moduleIndex = static_cast<int>(uniformDist(rng) * modules.size());
         auto moduleIt = modules.begin();
         std::advance(moduleIt, moduleIndex);
+        
         perturbedModule1 = moduleIt->first;
         
-        // Check if this is in a symmetry pair
-        auto symGroup = it->second->getSymmetryGroup();
-        bool isInSymPair = false;
-        for (const auto& pair : symGroup->getSymmetryPairs()) {
-            if (pair.first == perturbedModule1 || pair.second == perturbedModule1) {
-                isInSymPair = true;
-                break;
-            }
-        }
+        // Rotate the module (and its symmetric pair if applicable)
+        return asfTree->rotateModule(perturbedModule1);
+    }
+    
+    return false;
+}
+
+/**
+ * Pre-order traversal based perturbation
+ * This perturbation affects the tree structure by moving a node 
+ * based on a pre-order traversal sequence
+ */
+bool SimulatedAnnealing::perturbPreOrder() {
+    // Handle regular modules
+    if (regularTree && !regularModules.empty()) {
+        // Collect all nodes in pre-order
+        std::vector<std::shared_ptr<BStarTreeNode>> nodes;
+        collectNodesPreOrder(regularTree, nodes);
         
-        // For modules in symmetry pairs, we need to rotate both modules
-        if (isInSymPair) {
-            return it->second->rotateModule(perturbedModule1);
-        } else {
-            // For self-symmetric modules, just rotate directly
-            auto modIt = modules.find(perturbedModule1);
-            if (modIt != modules.end()) {
-                modIt->second->rotate();
-                return true;
-            }
+        if (nodes.size() < 2) return false;
+        
+        // Select two random positions
+        int pos1 = static_cast<int>(uniformDist(rng) * nodes.size());
+        int pos2;
+        do {
+            pos2 = static_cast<int>(uniformDist(rng) * nodes.size());
+        } while (pos1 == pos2);
+        
+        auto node1 = nodes[pos1];
+        auto node2 = nodes[pos2];
+        
+        perturbedModule1 = node1->getModuleName();
+        perturbedModule2 = node2->getModuleName();
+        
+        // Swap the nodes in the tree - this is a simplified version that
+        // preserves the pre-order relationship
+        swapTreeNodes(node1, node2);
+        
+        return true;
+    } 
+    // Handle symmetry groups
+    else if (!symmetryTrees.empty()) {
+        // Select a random symmetry group
+        int index = static_cast<int>(uniformDist(rng) * symmetryTrees.size());
+        auto it = symmetryTrees.begin();
+        std::advance(it, index);
+        
+        perturbedSymGroup = it->first;
+        auto asfTree = it->second;
+        
+        // Perform pre-order perturbation on the ASF-B*-tree
+        auto root = asfTree->getRoot();
+        if (!root) return false;
+        
+        // Collect nodes in pre-order 
+        std::vector<std::shared_ptr<BStarTreeNode>> nodes;
+        collectNodesPreOrder(root, nodes);
+        
+        if (nodes.size() < 2) return false;
+        
+        // Select two random positions
+        int pos1 = static_cast<int>(uniformDist(rng) * nodes.size());
+        int pos2;
+        do {
+            pos2 = static_cast<int>(uniformDist(rng) * nodes.size());
+        } while (pos1 == pos2);
+        
+        auto node1 = nodes[pos1];
+        auto node2 = nodes[pos2];
+        
+        perturbedModule1 = node1->getModuleName();
+        perturbedModule2 = node2->getModuleName();
+        
+        // Before swapping, check if we would violate symmetry constraints
+        bool node1RepresentsSym = asfTree->isRepresentative(node1->getModuleName());
+        bool node2RepresentsSym = asfTree->isRepresentative(node2->getModuleName());
+        
+        // Only swap if both are representatives or both are not
+        if (node1RepresentsSym == node2RepresentsSym) {
+            swapTreeNodes(node1, node2);
+            return true;
         }
     }
     
     return false;
+}
+
+/**
+ * In-order traversal based perturbation
+ * This perturbation affects the tree structure by moving a node 
+ * based on an in-order traversal sequence
+ */
+bool SimulatedAnnealing::perturbInOrder() {
+    // Handle regular modules
+    if (regularTree && !regularModules.empty()) {
+        // Collect all nodes in in-order
+        std::vector<std::shared_ptr<BStarTreeNode>> nodes;
+        collectNodesInOrder(regularTree, nodes);
+        
+        if (nodes.size() < 2) return false;
+        
+        // Select two random positions
+        int pos1 = static_cast<int>(uniformDist(rng) * nodes.size());
+        int pos2;
+        do {
+            pos2 = static_cast<int>(uniformDist(rng) * nodes.size());
+        } while (pos1 == pos2);
+        
+        auto node1 = nodes[pos1];
+        auto node2 = nodes[pos2];
+        
+        perturbedModule1 = node1->getModuleName();
+        perturbedModule2 = node2->getModuleName();
+        
+        // Swap the nodes in the tree - this preserves the in-order relationship
+        swapTreeNodes(node1, node2);
+        
+        return true;
+    } 
+    // Handle symmetry groups
+    else if (!symmetryTrees.empty()) {
+        // Select a random symmetry group
+        int index = static_cast<int>(uniformDist(rng) * symmetryTrees.size());
+        auto it = symmetryTrees.begin();
+        std::advance(it, index);
+        
+        perturbedSymGroup = it->first;
+        auto asfTree = it->second;
+        
+        // Perform in-order perturbation on the ASF-B*-tree
+        auto root = asfTree->getRoot();
+        if (!root) return false;
+        
+        // Collect nodes in in-order
+        std::vector<std::shared_ptr<BStarTreeNode>> nodes;
+        collectNodesInOrder(root, nodes);
+        
+        if (nodes.size() < 2) return false;
+        
+        // Select two random positions 
+        int pos1 = static_cast<int>(uniformDist(rng) * nodes.size());
+        int pos2;
+        do {
+            pos2 = static_cast<int>(uniformDist(rng) * nodes.size());
+        } while (pos1 == pos2);
+        
+        auto node1 = nodes[pos1];
+        auto node2 = nodes[pos2];
+        
+        perturbedModule1 = node1->getModuleName();
+        perturbedModule2 = node2->getModuleName();
+        
+        // Before swapping, check if we would violate symmetry constraints
+        bool node1Self = asfTree->isOnBoundary(node1->getModuleName());
+        bool node2Self = asfTree->isOnBoundary(node2->getModuleName());
+        
+        // Don't swap if one is on boundary and one is not
+        if (node1Self == node2Self) {
+            swapTreeNodes(node1, node2);
+            return true;
+        }
+    }
+    
+    return false;
+}
+
+/**
+ * Helper function to collect nodes in pre-order traversal
+ */
+void SimulatedAnnealing::collectNodesPreOrder(
+    const std::shared_ptr<BStarTreeNode>& root,
+    std::vector<std::shared_ptr<BStarTreeNode>>& nodes) {
+    
+    if (!root) return;
+    
+    // Pre-order: Root, Left, Right
+    nodes.push_back(root);
+    
+    if (root->getLeftChild()) {
+        collectNodesPreOrder(root->getLeftChild(), nodes);
+    }
+    
+    if (root->getRightChild()) {
+        collectNodesPreOrder(root->getRightChild(), nodes);
+    }
+}
+
+/**
+ * Helper function to collect nodes in in-order traversal
+ */
+void SimulatedAnnealing::collectNodesInOrder(
+    const std::shared_ptr<BStarTreeNode>& root,
+    std::vector<std::shared_ptr<BStarTreeNode>>& nodes) {
+    
+    if (!root) return;
+    
+    // In-order: Left, Root, Right
+    if (root->getLeftChild()) {
+        collectNodesInOrder(root->getLeftChild(), nodes);
+    }
+    
+    nodes.push_back(root);
+    
+    if (root->getRightChild()) {
+        collectNodesInOrder(root->getRightChild(), nodes);
+    }
+}
+
+/**
+ * Helper function to swap two nodes in a B*-tree
+ * This is a simplified version that preserves the tree structure
+ */
+void SimulatedAnnealing::swapTreeNodes(
+    const std::shared_ptr<BStarTreeNode>& node1,
+    const std::shared_ptr<BStarTreeNode>& node2) {
+    
+    if (!node1 || !node2 || node1 == node2) return;
+    
+    // We'll swap the module names rather than restructuring the tree
+    // This preserves the tree topology while changing the node content
+    std::string tempName = node1->getModuleName();
+    
+    // We can't directly change the module name in the node, so we'll
+    // swap the modules in regularModules or in the symmetry tree
+    
+    // Find which map contains these modules
+    bool inRegular1 = regularModules.find(node1->getModuleName()) != regularModules.end();
+    bool inRegular2 = regularModules.find(node2->getModuleName()) != regularModules.end();
+    
+    if (inRegular1 && inRegular2) {
+        // Swap modules in regularModules
+        auto module1 = regularModules[node1->getModuleName()];
+        auto module2 = regularModules[node2->getModuleName()];
+        
+        int x1 = module1->getX();
+        int y1 = module1->getY();
+        int x2 = module2->getX();
+        int y2 = module2->getY();
+        
+        // Swap positions
+        module1->setPosition(x2, y2);
+        module2->setPosition(x1, y1);
+    } else {
+        // One or both are in a symmetry tree - find which one
+        for (auto& pair : symmetryTrees) {
+            auto& tree = pair.second;
+            auto& modules = tree->getModules();
+            
+            bool containsNode1 = modules.find(node1->getModuleName()) != modules.end();
+            bool containsNode2 = modules.find(node2->getModuleName()) != modules.end();
+            
+            if (containsNode1 && containsNode2) {
+                // Both modules are in this symmetry tree
+                auto moduleIt1 = modules.find(node1->getModuleName());
+                if (moduleIt1 == modules.end()) {
+                    std::cerr << "Module not found: " << node1->getModuleName() << std::endl;
+                    return;
+                }
+                auto module1 = moduleIt1->second;
+                auto module2It = modules.find(node2->getModuleName());
+                if (module2It == modules.end()) {
+                    std::cerr << "Module not found: " << node2->getModuleName() << std::endl;
+                    return;
+                }
+                auto module2 = module2It->second;
+                
+                int x1 = module1->getX();
+                int y1 = module1->getY();
+                int x2 = module2->getX();
+                int y2 = module2->getY();
+                
+                // Swap positions
+                module1->setPosition(x2, y2);
+                module2->setPosition(x1, y1);
+                
+                break;
+            }
+        }
+    }
 }
 
 bool SimulatedAnnealing::perturbMove() {

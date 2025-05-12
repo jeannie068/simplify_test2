@@ -19,10 +19,8 @@
 enum class PerturbationType {
     NONE,
     ROTATE,
-    MOVE,
-    SWAP,
-    CHANGE_REP,
-    CONVERT_SYM
+    PRE_ORDER,
+    IN_ORDER
 };
 
 // Structure to store module state for efficient reversion
@@ -210,6 +208,13 @@ private:
      */
     bool isTimeLimitReached() const;
 
+    void collectNodesPreOrder(const std::shared_ptr<BStarTreeNode>& root, 
+                             std::vector<std::shared_ptr<BStarTreeNode>>& nodes);
+    void collectNodesInOrder(const std::shared_ptr<BStarTreeNode>& root, 
+                            std::vector<std::shared_ptr<BStarTreeNode>>& nodes);
+    void swapTreeNodes(const std::shared_ptr<BStarTreeNode>& node1, 
+                      const std::shared_ptr<BStarTreeNode>& node2);
+
 public:
     /**
      * Constructor
@@ -238,6 +243,9 @@ public:
         int noImprovementLimit = 3000,
         int timeLimit = 290
     );
+
+    bool perturbPreOrder();
+    bool perturbInOrder();
     
     /**
      * Sets perturbation probabilities

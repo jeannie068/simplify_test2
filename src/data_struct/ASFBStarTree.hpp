@@ -38,7 +38,7 @@ private:
     double symmetryAxisPosition;
     
     // Internal helper methods
-    bool isOnBoundary(const string& moduleName) const;
+
     bool canMoveNode(const shared_ptr<BStarTreeNode>& node, 
                      const shared_ptr<BStarTreeNode>& newParent, 
                      bool asLeftChild) const;
@@ -69,6 +69,7 @@ public:
     bool validateSymmetryConstraints() const;
     bool isOnCorrectBranch(const string& moduleName) const;
     bool isSymmetryIslandValid() const;
+    bool isOnBoundary(const string& moduleName) const;
     
     /**
      * Calculates the coordinates of all modules in the symmetry group

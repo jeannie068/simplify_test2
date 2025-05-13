@@ -22,9 +22,9 @@ ASFBStarTree::ASFBStarTree(shared_ptr<SymmetryGroup> symmetryGroup)
     if (symmetryGroup) {
         // Process symmetry pairs
         for (const auto& pair : symmetryGroup->getSymmetryPairs()) {
-            // For each symmetry pair, choose the second module as the representative
+            // For each symmetry pair, make both modules represent themselves
             representativeMap[pair.first] = pair.second;
-            representativeMap[pair.second] = pair.second;  // Representative represents itself
+            representativeMap[pair.second] = pair.second;
             
             // Track the symmetric pair relationship
             symmetricPairMap[pair.first] = pair.second;
@@ -33,7 +33,7 @@ ASFBStarTree::ASFBStarTree(shared_ptr<SymmetryGroup> symmetryGroup)
         
         // Process self-symmetric modules
         for (const auto& moduleName : symmetryGroup->getSelfSymmetric()) {
-            // For a self-symmetric module, it represents itself but half of it
+            // For a self-symmetric module, it represents itself
             representativeMap[moduleName] = moduleName;
             selfSymmetricModules.push_back(moduleName);
         }
@@ -416,8 +416,6 @@ bool ASFBStarTree::validateSymmetryConstraints() const {
 
 // New function to calculate the optimal symmetry axis position
 void ASFBStarTree::calculateSymmetryAxis() {
-    // We need to calculate the axis position based on the placed modules
-    
     // For empty tree, use default position
     if (!root) {
         symmetryAxisPosition = 0.0;
@@ -444,12 +442,12 @@ void ASFBStarTree::calculateSymmetryAxis() {
         maxY = std::max(maxY, module->getY() + module->getHeight());
     }
     
-    // Set symmetry axis position based on the bounding box
+    // Set symmetry axis position to the middle of the bounding box
     if (symmetryGroup->getType() == SymmetryType::VERTICAL) {
-        // For vertical symmetry, position axis at the right edge of the bounding box
+        // For vertical symmetry, position axis at the middle of the bounding box
         symmetryAxisPosition = maxX;
     } else { // HORIZONTAL
-        // For horizontal symmetry, position axis at the top edge of the bounding box
+        // For horizontal symmetry, position axis at the middle of the bounding box
         symmetryAxisPosition = maxY;
     }
     

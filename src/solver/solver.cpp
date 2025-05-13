@@ -95,6 +95,375 @@ void PlacementSolver::initializeModuleGrouping() {
               << symmetryGroups.size() << " symmetry groups" << std::endl;
 }
 
+void PlacementSolver::createInitialSolution() {
+    // Initialize ASF-B*-trees for symmetry groups
+    for (auto& pair : symmetryTrees) {
+        pair.second->constructInitialTree();
+    }
+    
+    // Create B*-tree for regular modules (if any)
+    regularTree = nullptr;
+    if (!regularModules.empty()) {
+        // Create a basic B*-tree structure
+        // Sort regular modules by area (largest first)
+        std::vector<std::pair<std::string, std::shared_ptr<Module>>> sortedModules;
+        for (const auto& pair : regularModules) {
+            sortedModules.push_back(pair);
+        }
+        
+        std::sort(sortedModules.begin(), sortedModules.end(), 
+                 [](const auto& a, const auto& b) {
+                     return a.second->getArea() > b.second->getArea();
+                 });
+        
+        // Create the tree - modified approach for better initial placement
+        if (!sortedModules.empty()) {
+            regularTree = std::make_shared<BStarTreeNode>(sortedModules[0].first);
+            
+            if (sortedModules.size() > 1) {
+                // Create a more balanced tree structure (not just left-skewed)
+                for (size_t i = 1; i < sortedModules.size(); ++i) {
+                    // Find a suitable parent node
+                    auto newNode = std::make_shared<BStarTreeNode>(sortedModules[i].first);
+                    
+                    // Use BFS to find a node with available child slot
+                    std::queue<std::shared_ptr<BStarTreeNode>> nodeQueue;
+                    nodeQueue.push(regularTree);
+                    
+                    bool placed = false;
+                    while (!nodeQueue.empty() && !placed) {
+                        auto current = nodeQueue.front();
+                        nodeQueue.pop();
+                        
+                        if (!current->getLeftChild()) {
+                            current->setLeftChild(newNode);
+                            newNode->setParent(current);
+                            placed = true;
+                        } else if (!current->getRightChild()) {
+                            current->setRightChild(newNode);
+                            newNode->setParent(current);
+                            placed = true;
+                        } else {
+                            nodeQueue.push(current->getLeftChild());
+                            nodeQueue.push(current->getRightChild());
+                        }
+                    }
+                    
+                    // If not placed yet (shouldn't happen), add as a left child to some leaf
+                    if (!placed) {
+                        auto current = regularTree;
+                        while (current->getLeftChild()) {
+                            current = current->getLeftChild();
+                        }
+                        current->setLeftChild(newNode);
+                        newNode->setParent(current);
+                    }
+                }
+            }
+        }
+    }
+    
+    // Initial packing
+    packSolution();
+}
+
+void PlacementSolver::createGlobalBTree() {
+    // Clear existing tree
+    globalTree = nullptr;
+    globalNodes.clear();
+    
+    // Combine regular modules and symmetry islands
+    std::vector<std::pair<std::string, int>> allNodes;
+    
+    // Add regular modules
+    for (const auto& pair : regularModules) {
+        std::string nodeName = "reg_" + pair.first;
+        globalNodes[nodeName] = pair.second;
+        allNodes.push_back({nodeName, pair.second->getArea()});
+    }
+    
+    // Add symmetry islands
+    for (const auto& island : symmetryIslands) {
+        std::string nodeName = "island_" + island->getName();
+        globalNodes[nodeName] = island;
+        allNodes.push_back({nodeName, island->getArea()});
+    }
+    
+    // Sort by area (largest first)
+    std::sort(allNodes.begin(), allNodes.end(),
+              [](const auto& a, const auto& b) {
+                  return a.second > b.second;
+              });
+    
+    // Create B*-tree in a balanced way
+    if (!allNodes.empty()) {
+        // Start with the root node (largest area)
+        globalTree = std::make_shared<BStarTreeNode>(allNodes[0].first);
+        
+        // Add other nodes level by level (similar to creating a complete binary tree)
+        for (size_t i = 1; i < allNodes.size(); ++i) {
+            // Find a suitable parent using BFS
+            std::queue<std::shared_ptr<BStarTreeNode>> queue;
+            queue.push(globalTree);
+            
+            while (!queue.empty()) {
+                auto current = queue.front();
+                queue.pop();
+                
+                if (!current->getLeftChild()) {
+                    auto newNode = std::make_shared<BStarTreeNode>(allNodes[i].first);
+                    current->setLeftChild(newNode);
+                    newNode->setParent(current);
+                    break;
+                } else if (!current->getRightChild()) {
+                    auto newNode = std::make_shared<BStarTreeNode>(allNodes[i].first);
+                    current->setRightChild(newNode);
+                    newNode->setParent(current);
+                    break;
+                } else {
+                    queue.push(current->getLeftChild());
+                    queue.push(current->getRightChild());
+                }
+            }
+        }
+    }
+}
+
+// ======== 5. Implementation of packGlobalBTree() ========
+
+bool PlacementSolver::packGlobalBTree() {
+    if (!globalTree) {
+        return true; // Nothing to pack
+    }
+    
+    // Create a contour for packing
+    std::shared_ptr<Contour> contour = std::make_shared<Contour>();
+    
+    // Initialize contour with a segment at y=0
+    contour->addSegment(0, std::numeric_limits<int>::max(), 0);
+    
+    // Pack using BFS traversal
+    std::queue<std::shared_ptr<BStarTreeNode>> queue;
+    queue.push(globalTree);
+    
+    while (!queue.empty()) {
+        auto node = queue.front();
+        queue.pop();
+        
+        const std::string& nodeName = node->getModuleName();
+        auto it = globalNodes.find(nodeName);
+        if (it == globalNodes.end()) {
+            continue;
+        }
+        
+        int width = 0, height = 0;
+        
+        // Calculate position based on B*-tree rules
+        int x = 0, y = 0;
+        
+        if (node->getParent()) {
+            auto parentName = node->getParent()->getModuleName();
+            auto parentIt = globalNodes.find(parentName);
+            if (parentIt != globalNodes.end()) {
+                int parentX = 0, parentY = 0, parentWidth = 0, parentHeight = 0;
+                
+                // Get parent dimensions and position
+                std::visit([&](auto&& arg) {
+                    using T = std::decay_t<decltype(arg)>;
+                    if constexpr (std::is_same_v<T, std::shared_ptr<Module>>) {
+                        parentX = arg->getX();
+                        parentY = arg->getY();
+                        parentWidth = arg->getWidth();
+                        parentHeight = arg->getHeight();
+                    } else if constexpr (std::is_same_v<T, std::shared_ptr<SymmetryIslandBlock>>) {
+                        parentX = arg->getX();
+                        parentY = arg->getY();
+                        parentWidth = arg->getWidth();
+                        parentHeight = arg->getHeight();
+                    }
+                }, parentIt->second);
+                
+                if (node->isLeftChild()) {
+                    // Left child: place to the right of parent
+                    x = parentX + parentWidth;
+                    y = parentY;
+                } else {
+                    // Right child: place above parent with same x
+                    x = parentX;
+                    y = parentY + parentHeight;
+                }
+            }
+        }
+        
+        // Get minimum y from the contour at this x position
+        std::visit([&](auto&& arg) {
+            using T = std::decay_t<decltype(arg)>;
+            if constexpr (std::is_same_v<T, std::shared_ptr<Module>>) {
+                width = arg->getWidth();
+                height = arg->getHeight();
+            } else if constexpr (std::is_same_v<T, std::shared_ptr<SymmetryIslandBlock>>) {
+                width = arg->getWidth();
+                height = arg->getHeight();
+            }
+        }, it->second);
+        
+        y = std::max(y, contour->getHeight(x, x + width));
+        
+        // Set position
+        std::visit([x, y](auto&& arg) {
+            using T = std::decay_t<decltype(arg)>;
+            if constexpr (std::is_same_v<T, std::shared_ptr<Module>>) {
+                arg->setPosition(x, y);
+            } else if constexpr (std::is_same_v<T, std::shared_ptr<SymmetryIslandBlock>>) {
+                arg->setPosition(x, y);
+            }
+        }, it->second);
+        
+        // Update contour
+        contour->addSegment(x, x + width, y + height);
+        
+        // Add children to queue
+        if (node->getLeftChild()) {
+            queue.push(node->getLeftChild());
+        }
+        if (node->getRightChild()) {
+            queue.push(node->getRightChild());
+        }
+    }
+    
+    return true;
+}
+
+bool PlacementSolver::packSolution() {
+    // Reset all module positions
+    for (auto& pair : allModules) {
+        pair.second->setPosition(0, 0);
+    }
+    
+    // Create symmetry island blocks if not already created
+    if (symmetryIslands.empty()) {
+        for (const auto& pair : symmetryTrees) {
+            auto islandBlock = std::make_shared<SymmetryIslandBlock>(
+                pair.first, pair.second);
+            symmetryIslands.push_back(islandBlock);
+        }
+    } else {
+        // Update existing islands' bounding boxes
+        for (auto& island : symmetryIslands) {
+            island->updateBoundingBox();
+        }
+    }
+    
+    // Create global B*-tree
+    createGlobalBTree();
+    
+    // Pack global B*-tree
+    if (!packGlobalBTree()) {
+        return false;
+    }
+    
+    // Final validation
+    if (hasOverlaps()) {
+        std::cerr << "Placement has overlapping modules" << std::endl;
+        return false;
+    }
+    
+    if (!validateSymmetryConstraints()) {
+        std::cerr << "Symmetry constraints violated" << std::endl;
+        return false;
+    }
+    
+    // Calculate total area
+    calculateTotalArea();
+    
+    return true;
+}
+
+bool PlacementSolver::packRegularModules(std::shared_ptr<Contour> horizontalContour, 
+                                       std::shared_ptr<Contour> verticalContour) {
+    if (!regularTree) return true;
+    
+    // Create a vector of regular modules sorted by area (largest first)
+    std::vector<std::pair<std::string, std::shared_ptr<Module>>> sortedModules;
+    for (const auto& pair : regularModules) {
+        sortedModules.push_back(pair);
+    }
+    
+    std::sort(sortedModules.begin(), sortedModules.end(), 
+             [](const auto& a, const auto& b) {
+                 return a.second->getArea() > b.second->getArea();
+             });
+    
+    // Process modules in order (BFS traversal of the B*-tree)
+    std::queue<std::shared_ptr<BStarTreeNode>> nodeQueue;
+    nodeQueue.push(regularTree);
+    
+    while (!nodeQueue.empty()) {
+        auto currentNode = nodeQueue.front();
+        nodeQueue.pop();
+        
+        const std::string& moduleName = currentNode->getModuleName();
+        auto moduleIt = regularModules.find(moduleName);
+        if (moduleIt == regularModules.end()) {
+            continue;
+        }
+        
+        auto module = moduleIt->second;
+        
+        int x = 0, y = 0;
+        
+        // Calculate position based on B*-tree rules and contour
+        if (currentNode->getParent()) {
+            auto parentName = currentNode->getParent()->getModuleName();
+            auto parentIt = regularModules.find(parentName);
+            if (parentIt != regularModules.end()) {
+                auto parentModule = parentIt->second;
+                
+                if (currentNode->isLeftChild()) {
+                    // Left child: place to the right of parent
+                    x = parentModule->getX() + parentModule->getWidth();
+                    // Get minimum y from the contour at this x position
+                    y = horizontalContour->getHeight(x, x + module->getWidth());
+                } else {
+                    // Right child: place above parent
+                    x = parentModule->getX();
+                    // Get minimum y from the contour (must be at least above parent)
+                    y = std::max(parentModule->getY() + parentModule->getHeight(),
+                                horizontalContour->getHeight(x, x + module->getWidth()));
+                }
+            }
+        } else {
+            // For root node, find the first available position on the contour
+            // that doesn't overlap with symmetry islands
+            int maxContourHeight = horizontalContour->getMaxHeight();
+            for (int testX = 0; testX <= maxContourHeight + 100; testX += 10) {
+                int testY = horizontalContour->getHeight(testX, testX + module->getWidth());
+                if (isPositionValid(testX, testY, module->getWidth(), module->getHeight())) {
+                    x = testX;
+                    y = testY;
+                    break;
+                }
+            }
+        }
+        
+        // Set the module's position
+        module->setPosition(x, y);
+        
+        // Update the contour with this module
+        horizontalContour->addSegment(x, x + module->getWidth(), y + module->getHeight());
+        verticalContour->addSegment(y, y + module->getHeight(), x + module->getWidth());
+        
+        // Add children to the queue
+        if (currentNode->getLeftChild()) {
+            nodeQueue.push(currentNode->getLeftChild());
+        }
+        if (currentNode->getRightChild()) {
+            nodeQueue.push(currentNode->getRightChild());
+        }
+    }
+    
+    return true;
+}
 
 int PlacementSolver::calculateTotalArea() {
     // Find the bounding rectangle of all modules
@@ -123,8 +492,27 @@ int PlacementSolver::calculateTotalArea() {
     return totalArea;
 }
 
+// Helper function to calculate area of a symmetry group
+int PlacementSolver::calculateSymmetryGroupArea(const std::shared_ptr<SymmetryGroup>& group) {
+    int area = 0;
+    for (const auto& pair : group->getSymmetryPairs()) {
+        if (allModules.find(pair.first) != allModules.end()) {
+            area += allModules[pair.first]->getArea();
+        }
+        if (allModules.find(pair.second) != allModules.end()) {
+            area += allModules[pair.second]->getArea();
+        }
+    }
+    for (const auto& module : group->getSelfSymmetric()) {
+        if (allModules.find(module) != allModules.end()) {
+            area += allModules[module]->getArea();
+        }
+    }
+    return area;
+}
+
 bool PlacementSolver::hasOverlaps() const {
-    // Get all modules for overlap checking
+    // Check for overlaps between regular modules
     std::vector<std::shared_ptr<Module>> moduleList;
     
     // Collect all modules
@@ -132,39 +520,49 @@ bool PlacementSolver::hasOverlaps() const {
         moduleList.push_back(pair.second);
     }
     
-    // Check all pairs for overlaps using a more robust method
+    // Check all pairs for overlaps
     for (size_t i = 0; i < moduleList.size(); ++i) {
         const auto& module1 = moduleList[i];
         
         for (size_t j = i + 1; j < moduleList.size(); ++j) {
             const auto& module2 = moduleList[j];
             
-            // Check for overlap using more explicit calculations
-            int x1 = module1->getX();
-            int y1 = module1->getY();
-            int w1 = module1->getWidth();
-            int h1 = module1->getHeight();
+            // Skip if modules are in the same symmetry group
+            auto it1 = moduleToGroup.find(module1->getName());
+            auto it2 = moduleToGroup.find(module2->getName());
             
-            int x2 = module2->getX();
-            int y2 = module2->getY();
-            int w2 = module2->getWidth();
-            int h2 = module2->getHeight();
+            if (it1 != moduleToGroup.end() && it2 != moduleToGroup.end() && 
+                it1->second == it2->second) {
+                continue;
+            }
             
-            // Check if rectangles overlap
-            bool overlap = (x1 < x2 + w2) && (x2 < x1 + w1) && 
-                          (y1 < y2 + h2) && (y2 < y1 + h1);
-            
-            if (overlap) {
+            if (module1->overlaps(*module2)) {
                 std::cerr << "Overlap detected between modules: " 
-                         << module1->getName() << " (" << x1 << "," << y1 << "," << w1 << "," << h1 << ") and " 
-                         << module2->getName() << " (" << x2 << "," << y2 << "," << w2 << "," << h2 << ")" 
-                         << std::endl;
+                         << module1->getName() << " and " 
+                         << module2->getName() << std::endl;
                 return true;
             }
         }
     }
     
     return false;
+}
+
+
+// Helper function to check if a position is valid (no overlaps)
+bool PlacementSolver::isPositionValid(int x, int y, int width, int height) {
+    // Create a temporary module at the given position
+    auto tempModule = std::make_shared<Module>("temp", width, height);
+    tempModule->setPosition(x, y);
+    
+    // Check for overlaps with all other modules
+    for (const auto& pair : allModules) {
+        if (tempModule->overlaps(*pair.second)) {
+            return false;
+        }
+    }
+    
+    return true;
 }
 
 bool PlacementSolver::validateSymmetryConstraints() const {
@@ -352,85 +750,41 @@ void PlacementSolver::setTimeLimit(int seconds) {
 }
 
 bool PlacementSolver::solve() {
-    // Initialize random generator with provided seed
-    std::mt19937 rng(randomSeed);
-    std::uniform_real_distribution<double> uniformDist(0.0, 1.0);
-
-    // Start timing
-    auto startTime = std::chrono::steady_clock::now();
+    // Create initial solution
+    createInitialSolution();
     
-    std::cout << "Starting hierarchical placement..." << std::endl;
-    
-    // -------------------------------------------------------------------------
-    // STEP 1: Process each symmetry group internally with SA
-    // -------------------------------------------------------------------------
-    std::cout << "Phase 1: Processing symmetry groups internally..." << std::endl;
-    
-    for (auto& pair : symmetryTrees) {
-        std::string groupName = pair.first;
-        auto& asfTree = pair.second;
-        
-        std::cout << "Processing symmetry group: " << groupName << std::endl;
-        
-        // Run SA just for this symmetry group
-        if (!processSymmetryGroupInternally(asfTree, startTime)) {
-            std::cerr << "Failed to process symmetry group: " << groupName << std::endl;
-            // Continue with next group instead of failing completely
-        }
-        
-        // Validate the symmetry group placement
-        if (!validateSymmetryGroup(asfTree)) {
-            std::cerr << "Warning: Symmetry group " << groupName << " has validation issues" << std::endl;
-            
-            // Try to fix the symmetry group by re-packing it
-            asfTree->constructInitialTree();
-            if (!asfTree->pack()) {
-                std::cerr << "Error: Failed to re-pack symmetry group " << groupName << std::endl;
-            }
-        }
-        
-        // Finalize the symmetry group's contour
-        finalizeSymmetryGroupContour(asfTree);
+    if (!regularTree && symmetryTrees.empty()) {
+        std::cerr << "Error: No modules to place." << std::endl;
+        return false;
     }
     
-    // -------------------------------------------------------------------------
-    // STEP 2: Place regular modules and finalized symmetry groups
-    // -------------------------------------------------------------------------
-    std::cout << "Phase 2: Combined placement of symmetry groups and regular modules..." << std::endl;
-    
-    // Create initial solution for regular modules
-    createInitialRegularSolution();
-    
     // Calculate initial area
-    int currentArea = calculateTotalArea();
-    int bestArea = currentArea;
+    calculateTotalArea();
+    std::cout << "Initial area: " << totalArea << std::endl;
     
-    // Save best solution
+    // Setup enhanced SA
+    std::cout << "Starting simulated annealing..." << std::endl;
+    std::cout << "Initial temperature: " << initialTemperature << std::endl;
+    std::cout << "Final temperature: " << finalTemperature << std::endl;
+    std::cout << "Cooling rate: " << coolingRate << std::endl;
+    std::cout << "Iterations per temperature: " << iterationsPerTemperature << std::endl;
+    std::cout << "No improvement limit: " << noImprovementLimit << std::endl;
+    
+    // Save initial solution as best solution
     std::map<std::string, std::pair<int, int>> bestPositions;
     std::map<std::string, bool> bestRotations;
+    int bestArea = totalArea;
     
-    // Save positions and rotations of regular modules only
-    for (const auto& pair : regularModules) {
+    // Save positions and rotations of all modules
+    for (const auto& pair : allModules) {
         const auto& module = pair.second;
         bestPositions[pair.first] = {module->getX(), module->getY()};
         bestRotations[pair.first] = module->getRotated();
     }
     
-    // Save positions of symmetry groups (as single units)
-    for (const auto& pair : symmetryGroups) {
-        const auto& group = pair;
-        
-        // Find a representative module from the group
-        for (const auto& symPair : group->getSymmetryPairs()) {
-            auto it = allModules.find(symPair.first);
-            if (it != allModules.end()) {
-                bestPositions[group->getName()] = {it->second->getX(), it->second->getY()};
-                break;
-            }
-        }
-    }
-    
-    std::cout << "Initial combined area: " << currentArea << std::endl;
+    // Initialize random number generator
+    std::mt19937 rng(randomSeed);
+    std::uniform_real_distribution<double> uniformDist(0.0, 1.0);
     
     // SA parameters
     double temperature = initialTemperature;
@@ -439,10 +793,11 @@ bool PlacementSolver::solve() {
     int acceptedMoves = 0;
     int rejectedMoves = 0;
     
-    // Main SA loop for combined placement
-    while (temperature > finalTemperature && 
-           noImprovementCount < noImprovementLimit) {
-        
+    // Start timing
+    auto startTime = std::chrono::steady_clock::now();
+    
+    // Main SA loop
+    while (temperature > finalTemperature && noImprovementCount < noImprovementLimit) {
         // Check time limit
         auto currentTime = std::chrono::steady_clock::now();
         auto elapsedSeconds = std::chrono::duration_cast<std::chrono::seconds>(
@@ -464,42 +819,169 @@ bool PlacementSolver::solve() {
             std::map<std::string, std::pair<int, int>> currentPositions;
             std::map<std::string, bool> currentRotations;
             
-            // Store the current state of regular modules
-            for (const auto& pair : regularModules) {
+            // Store the current state of each module
+            for (const auto& pair : allModules) {
                 const auto& module = pair.second;
                 currentPositions[pair.first] = {module->getX(), module->getY()};
                 currentRotations[pair.first] = module->getRotated();
             }
             
-            // Store current positions of symmetry groups
+            // Store current symmetry axis positions
+            std::map<std::string, double> currentAxes;
             for (const auto& pair : symmetryTrees) {
-                // Get the bounding box of the symmetry group
-                int minX = std::numeric_limits<int>::max();
-                int minY = std::numeric_limits<int>::max();
-                
-                for (const auto& modPair : pair.second->getModules()) {
-                    auto module = modPair.second;
-                    minX = std::min(minX, module->getX());
-                    minY = std::min(minY, module->getY());
-                }
-                
-                currentPositions[pair.first] = {minX, minY};
+                currentAxes[pair.first] = pair.second->getSymmetryAxisPosition();
             }
             
-            // Perform a perturbation on the combined placement
-            bool perturbSuccess = perturbCombinedPlacement(rng, uniformDist);
+            // Perform a random perturbation
+            bool perturbSuccess = false;
+            std::string perturbedGroup;
+            std::string perturbedModule;
             
+            // Choose perturbation type
+            double randVal = uniformDist(rng);
+            
+            if (randVal < probRotate) {
+                // Rotate a random module
+                if (!regularModules.empty() && uniformDist(rng) < 0.5) {
+                    // Rotate a regular module
+                    auto it = regularModules.begin();
+                    std::advance(it, uniformDist(rng) * regularModules.size());
+                    perturbedModule = it->first;
+                    it->second->rotate();
+                    perturbSuccess = true;
+                } else if (!symmetryTrees.empty()) {
+                    // Rotate a module in a symmetry group
+                    auto it = symmetryTrees.begin();
+                    std::advance(it, uniformDist(rng) * symmetryTrees.size());
+                    perturbedGroup = it->first;
+                    
+                    // Get a random module from the symmetry group
+                    auto& modules = it->second->getModules();
+                    if (!modules.empty()) {
+                        auto moduleIt = modules.begin();
+                        std::advance(moduleIt, uniformDist(rng) * modules.size());
+                        perturbedModule = moduleIt->first;
+                        
+                        // Rotate the module
+                        perturbSuccess = it->second->rotateModule(perturbedModule);
+                    }
+                }
+            } else if (randVal < probRotate + probMove && regularTree) {
+                // Move operation for regular modules (simplified - just reorder the tree)
+                if (regularTree && regularModules.size() > 1) {
+                    // Find two random nodes to swap positions
+                    std::vector<std::string> regularModuleNames;
+                    for (const auto& pair : regularModules) {
+                        regularModuleNames.push_back(pair.first);
+                    }
+                    
+                    if (regularModuleNames.size() >= 2) {
+                        // Pick two random modules
+                        int idx1 = uniformDist(rng) * regularModuleNames.size();
+                        int idx2;
+                        do {
+                            idx2 = uniformDist(rng) * regularModuleNames.size();
+                        } while (idx2 == idx1);
+                        
+                        // Swap positions
+                        std::string name1 = regularModuleNames[idx1];
+                        std::string name2 = regularModuleNames[idx2];
+                        
+                        auto module1 = regularModules[name1];
+                        auto module2 = regularModules[name2];
+                        
+                        // Exchange positions
+                        int tmpX = module1->getX();
+                        int tmpY = module1->getY();
+                        module1->setPosition(module2->getX(), module2->getY());
+                        module2->setPosition(tmpX, tmpY);
+                        
+                        perturbSuccess = true;
+                    }
+                }
+            } else if (randVal < probRotate + probMove + probSwap) {
+                // Swap modules within a symmetry group or between regular modules
+                if (uniformDist(rng) < 0.5 && regularModules.size() >= 2) {
+                    // Swap two regular modules (simplified)
+                    std::vector<std::string> regularModuleNames;
+                    for (const auto& pair : regularModules) {
+                        regularModuleNames.push_back(pair.first);
+                    }
+                    
+                    if (regularModuleNames.size() >= 2) {
+                        // Pick two random modules
+                        int idx1 = uniformDist(rng) * regularModuleNames.size();
+                        int idx2;
+                        do {
+                            idx2 = uniformDist(rng) * regularModuleNames.size();
+                        } while (idx2 == idx1);
+                        
+                        // Swap their positions
+                        std::string name1 = regularModuleNames[idx1];
+                        std::string name2 = regularModuleNames[idx2];
+                        
+                        auto module1 = regularModules[name1];
+                        auto module2 = regularModules[name2];
+                        
+                        // Swap positions if dimensions are compatible
+                        if (module1->getWidth() <= module2->getWidth() &&
+                            module1->getHeight() <= module2->getHeight()) {
+                            int tmpX = module1->getX();
+                            int tmpY = module1->getY();
+                            module1->setPosition(module2->getX(), module2->getY());
+                            module2->setPosition(tmpX, tmpY);
+                            perturbSuccess = true;
+                        }
+                    }
+                } else if (!symmetryTrees.empty()) {
+                    // Swap modules within a symmetry group (more complex)
+                    // Not implemented in this simplified version
+                }
+            } else if (randVal < probRotate + probMove + probSwap + probChangeRep) {
+                // Change representative in a symmetry group
+                if (!symmetryTrees.empty()) {
+                    auto it = symmetryTrees.begin();
+                    std::advance(it, uniformDist(rng) * symmetryTrees.size());
+                    perturbedGroup = it->first;
+                    
+                    // Get a random symmetry pair
+                    auto group = it->second->getSymmetryGroup();
+                    const auto& pairs = group->getSymmetryPairs();
+                    if (!pairs.empty()) {
+                        int pairIndex = uniformDist(rng) * pairs.size();
+                        const auto& pair = pairs[pairIndex];
+                        
+                        // Choose one of the modules in the pair
+                        perturbedModule = (uniformDist(rng) < 0.5) ? pair.first : pair.second;
+                        
+                        // Change representative
+                        perturbSuccess = it->second->changeRepresentative(perturbedModule);
+                    }
+                }
+            } else {
+                // Convert symmetry type
+                if (!symmetryTrees.empty()) {
+                    auto it = symmetryTrees.begin();
+                    std::advance(it, uniformDist(rng) * symmetryTrees.size());
+                    perturbedGroup = it->first;
+                    
+                    // Convert symmetry type
+                    perturbSuccess = it->second->convertSymmetryType();
+                }
+            }
+            
+            // Skip if perturbation failed
             if (!perturbSuccess) {
                 continue;
             }
             
-            // Pack the solution and check if it's valid
-            bool packSuccess = packCombinedSolution();
+            // Pack solution and check if it's valid
+            bool packSuccess = packSolution();
             
             if (packSuccess && !hasOverlaps() && validateSymmetryConstraints()) {
                 // Calculate new area
                 int newArea = calculateTotalArea();
-                int deltaCost = newArea - currentArea;
+                int deltaCost = newArea - totalArea;
                 
                 // Decide whether to accept
                 bool accept = false;
@@ -511,25 +993,10 @@ bool PlacementSolver::solve() {
                         bestArea = newArea;
                         
                         // Update best solution
-                        for (const auto& pair : regularModules) {
+                        for (const auto& pair : allModules) {
                             const auto& module = pair.second;
                             bestPositions[pair.first] = {module->getX(), module->getY()};
                             bestRotations[pair.first] = module->getRotated();
-                        }
-                        
-                        // Save positions of symmetry groups
-                        for (const auto& pair : symmetryTrees) {
-                            // Get the bounding box of the symmetry group
-                            int minX = std::numeric_limits<int>::max();
-                            int minY = std::numeric_limits<int>::max();
-                            
-                            for (const auto& modPair : pair.second->getModules()) {
-                                auto module = modPair.second;
-                                minX = std::min(minX, module->getX());
-                                minY = std::min(minY, module->getY());
-                            }
-                            
-                            bestPositions[pair.first] = {minX, minY};
                         }
                         
                         // Reset no improvement counter
@@ -543,15 +1010,15 @@ bool PlacementSolver::solve() {
                 
                 if (accept) {
                     // Move accepted
-                    currentArea = newArea;
+                    totalArea = newArea;
                     acceptedMoves++;
                     acceptedInPassCount++;
                 } else {
                     // Move rejected, restore previous state
                     rejectedMoves++;
                     
-                    // Restore regular module positions and rotations
-                    for (auto& pair : regularModules) {
+                    // Restore all module positions and rotations
+                    for (auto& pair : allModules) {
                         auto module = pair.second;
                         const auto& oldPos = currentPositions[pair.first];
                         bool oldRot = currentRotations[pair.first];
@@ -560,44 +1027,23 @@ bool PlacementSolver::solve() {
                         module->setRotation(oldRot);
                     }
                     
-                    // Restore symmetry group positions
+                    // Restore symmetry axis positions
                     for (auto& pair : symmetryTrees) {
-                        const auto& oldPos = currentPositions[pair.first];
-                        int deltaX, deltaY;
-                        
-                        // Calculate the current position to determine delta
-                        int currentMinX = std::numeric_limits<int>::max();
-                        int currentMinY = std::numeric_limits<int>::max();
-                        
-                        for (const auto& modPair : pair.second->getModules()) {
-                            auto module = modPair.second;
-                            currentMinX = std::min(currentMinX, module->getX());
-                            currentMinY = std::min(currentMinY, module->getY());
-                        }
-                        
-                        // Calculate deltas
-                        deltaX = oldPos.first - currentMinX;
-                        deltaY = oldPos.second - currentMinY;
-                        
-                        // Apply the delta to all modules in the group
-                        for (auto& modPair : pair.second->getModules()) {
-                            auto module = modPair.second;
-                            module->setPosition(
-                                module->getX() + deltaX,
-                                module->getY() + deltaY
-                            );
-                        }
+                        auto& tree = pair.second;
+                        auto group = tree->getSymmetryGroup();
+                        double oldAxis = currentAxes[pair.first];
+                        group->setAxisPosition(oldAxis);
                     }
                     
-                    // Recalculate area
+                    // Restore area
                     calculateTotalArea();
                 }
             } else {
                 // Invalid placement, restore previous state
                 rejectedMoves++;
                 
-                // Restore regular module positions and rotations
-                for (auto& pair : regularModules) {
+                // Restore all module positions and rotations
+                for (auto& pair : allModules) {
                     auto module = pair.second;
                     const auto& oldPos = currentPositions[pair.first];
                     bool oldRot = currentRotations[pair.first];
@@ -606,33 +1052,12 @@ bool PlacementSolver::solve() {
                     module->setRotation(oldRot);
                 }
                 
-                // Restore symmetry group positions
+                // Restore symmetry axis positions
                 for (auto& pair : symmetryTrees) {
-                    const auto& oldPos = currentPositions[pair.first];
-                    int deltaX, deltaY;
-                    
-                    // Calculate the current position to determine delta
-                    int currentMinX = std::numeric_limits<int>::max();
-                    int currentMinY = std::numeric_limits<int>::max();
-                    
-                    for (const auto& modPair : pair.second->getModules()) {
-                        auto module = modPair.second;
-                        currentMinX = std::min(currentMinX, module->getX());
-                        currentMinY = std::min(currentMinY, module->getY());
-                    }
-                    
-                    // Calculate deltas
-                    deltaX = oldPos.first - currentMinX;
-                    deltaY = oldPos.second - currentMinY;
-                    
-                    // Apply the delta to all modules in the group
-                    for (auto& modPair : pair.second->getModules()) {
-                        auto module = modPair.second;
-                        module->setPosition(
-                            module->getX() + deltaX,
-                            module->getY() + deltaY
-                        );
-                    }
+                    auto& tree = pair.second;
+                    auto group = tree->getSymmetryGroup();
+                    double oldAxis = currentAxes[pair.first];
+                    group->setAxisPosition(oldAxis);
                 }
                 
                 // Restore area
@@ -654,850 +1079,133 @@ bool PlacementSolver::solve() {
         
         // Adaptive cooling schedule
         if (acceptanceRatio > 0.8) {
+            // Cool faster if acceptance rate is high
             temperature *= coolingRate * 0.9;
         } else if (acceptanceRatio < 0.1) {
+            // Cool slower if acceptance rate is low
             temperature *= coolingRate * 1.1;
             if (temperature > initialTemperature) {
                 temperature = initialTemperature;
             }
         } else {
+            // Normal cooling
             temperature *= coolingRate;
         }
         
         std::cout << "Temperature: " << temperature 
                   << ", Best area: " << bestArea 
-                  << ", Current area: " << currentArea 
+                  << ", Current area: " << totalArea 
                   << ", No improvement: " << noImprovementCount 
                   << ", Acceptance ratio: " << acceptanceRatio 
                   << std::endl;
     }
     
     // Restore best solution
-    // Restore regular module positions
-    for (auto& pair : regularModules) {
+    for (auto& pair : allModules) {
         auto module = pair.second;
-        auto it = bestPositions.find(pair.first);
-        if (it != bestPositions.end()) {
-            const auto& bestPos = it->second;
+        const auto& bestPos = bestPositions[pair.first];
+        bool bestRot = bestRotations[pair.first];
+        
+        module->setPosition(bestPos.first, bestPos.second);
+        module->setRotation(bestRot);
+    }
+    
+    // Make sure symmetry axis positions are correct
+    for (auto& pair : symmetryTrees) {
+        auto& tree = pair.second;
+        auto group = tree->getSymmetryGroup();
+        
+        if (group->getType() == SymmetryType::VERTICAL) {
+            // For each symmetry pair, find the midpoint of their X coordinates
+            double sumAxis = 0.0;
+            int count = 0;
+            
+            for (const auto& symPair : group->getSymmetryPairs()) {
+                auto it1 = allModules.find(symPair.first);
+                auto it2 = allModules.find(symPair.second);
+                
+                if (it1 != allModules.end() && it2 != allModules.end()) {
+                    auto& mod1 = it1->second;
+                    auto& mod2 = it2->second;
+                    
+                    // Calculate centers
+                    double center1X = mod1->getX() + mod1->getWidth() / 2.0;
+                    double center2X = mod2->getX() + mod2->getWidth() / 2.0;
+                    
+                    // X1 + X2 = 2 * axis
+                    double axis = (center1X + center2X) / 2.0;
+                    sumAxis += axis;
+                    count++;
+                }
+            }
+            
+            if (count > 0) {
+                double axisPos = sumAxis / count;
+                group->setAxisPosition(axisPos);
+            }
+        } else { // HORIZONTAL
+            // For each symmetry pair, find the midpoint of their Y coordinates
+            double sumAxis = 0.0;
+            int count = 0;
+            
+            for (const auto& symPair : group->getSymmetryPairs()) {
+                auto it1 = allModules.find(symPair.first);
+                auto it2 = allModules.find(symPair.second);
+                
+                if (it1 != allModules.end() && it2 != allModules.end()) {
+                    auto& mod1 = it1->second;
+                    auto& mod2 = it2->second;
+                    
+                    // Calculate centers
+                    double center1Y = mod1->getY() + mod1->getHeight() / 2.0;
+                    double center2Y = mod2->getY() + mod2->getHeight() / 2.0;
+                    
+                    // Y1 + Y2 = 2 * axis
+                    double axis = (center1Y + center2Y) / 2.0;
+                    sumAxis += axis;
+                    count++;
+                }
+            }
+            
+            if (count > 0) {
+                double axisPos = sumAxis / count;
+                group->setAxisPosition(axisPos);
+            }
+        }
+    }
+    
+    // Final pack and validation
+    bool finalPackSuccess = packSolution();
+    if (!finalPackSuccess) {
+        std::cerr << "Final packing failed, trying to recover..." << std::endl;
+        
+        // Reapply best positions directly
+        for (auto& pair : allModules) {
+            auto module = pair.second;
+            const auto& bestPos = bestPositions[pair.first];
             bool bestRot = bestRotations[pair.first];
             
             module->setPosition(bestPos.first, bestPos.second);
             module->setRotation(bestRot);
         }
-    }
-    
-    // Restore symmetry group positions
-    for (auto& pair : symmetryTrees) {
-        auto it = bestPositions.find(pair.first);
-        if (it != bestPositions.end()) {
-            const auto& bestPos = it->second;
-            
-            // Calculate the current position to determine delta
-            int currentMinX = std::numeric_limits<int>::max();
-            int currentMinY = std::numeric_limits<int>::max();
-            
-            for (const auto& modPair : pair.second->getModules()) {
-                auto module = modPair.second;
-                currentMinX = std::min(currentMinX, module->getX());
-                currentMinY = std::min(currentMinY, module->getY());
-            }
-            
-            // Calculate deltas
-            int deltaX = bestPos.first - currentMinX;
-            int deltaY = bestPos.second - currentMinY;
-            
-            // Apply the delta to all modules in the group
-            for (auto& modPair : pair.second->getModules()) {
-                auto module = modPair.second;
-                module->setPosition(
-                    module->getX() + deltaX,
-                    module->getY() + deltaY
-                );
-            }
-        }
+        
+        // Recalculate area
+        calculateTotalArea();
     }
     
     // Final validation
-    bool finalValid = !hasOverlaps() && validateSymmetryConstraints();
-    
-    if (!finalValid) {
-        std::cerr << "Warning: Final solution has issues, attempting to fix..." << std::endl;
-        
-        // Try to fix each symmetry group
-        for (auto& pair : symmetryTrees) {
-            pair.second->pack();
-        }
-        
-        // Try to pack everything once more
-        packCombinedSolution();
-        
-        finalValid = !hasOverlaps() && validateSymmetryConstraints();
-        
-        if (!finalValid) {
-            std::cerr << "Warning: Could not fix all issues in final solution" << std::endl;
-        }
+    if (hasOverlaps()) {
+        std::cerr << "Warning: Final solution has overlaps" << std::endl;
     }
     
-    // Recalculate the total area
-    totalArea = calculateTotalArea();
+    if (!validateSymmetryConstraints()) {
+        std::cerr << "Warning: Final solution violates symmetry constraints" << std::endl;
+    }
     
+    std::cout << "Simulated annealing completed." << std::endl;
     std::cout << "Final area: " << totalArea << std::endl;
     
     return true;
-}
-
-/**
- * Process a single symmetry group with internal SA
- */
-bool PlacementSolver::processSymmetryGroupInternally (
-    std::shared_ptr<ASFBStarTree> asfTree,
-    const std::chrono::steady_clock::time_point& startTime) {
-    
-    // Initialize the tree if not already done
-    if (!asfTree->getRoot()) {
-        asfTree->constructInitialTree();
-    }
-    
-    // Initialize random generator
-    std::mt19937 rng(randomSeed);
-    std::uniform_real_distribution<double> uniformDist(0.0, 1.0);
-    
-    // Pack the initial solution
-    if (!asfTree->pack()) {
-        std::cerr << "Error: Initial packing of symmetry group failed" << std::endl;
-        return false;
-    }
-    
-    // Calculate initial area
-    int currentArea = asfTree->getArea();
-    int bestArea = currentArea;
-    
-    // Save best solution
-    std::map<std::string, std::tuple<int, int, bool>> bestModuleState;
-    for (const auto& pair : asfTree->getModules()) {
-        const auto& module = pair.second;
-        bestModuleState[pair.first] = std::make_tuple(
-            module->getX(), module->getY(), module->getRotated());
-    }
-    
-    // Tracking variables
-    double temperature = initialTemperature;
-    int noImprovementCount = 0;
-    int totalIterations = 0;
-    
-    // Main SA loop for internal symmetry group optimization
-    while (temperature > finalTemperature && noImprovementCount < noImprovementLimit) {
-        // Check time limit
-        auto currentTime = std::chrono::steady_clock::now();
-        auto elapsedSeconds = std::chrono::duration_cast<std::chrono::seconds>(
-            currentTime - startTime).count();
-        
-        if (elapsedSeconds >= timeLimit / 2) { // Use half the time for phase 1
-            std::cout << "Time limit for internal optimization reached" << std::endl;
-            break;
-        }
-        
-        int acceptedInThisPass = 0;
-        
-        // Iterations at current temperature
-        for (int i = 0; i < iterationsPerTemperature / 2; ++i) { // Fewer iterations for phase 1
-            totalIterations++;
-            
-            // Save current state
-            std::map<std::string, std::tuple<int, int, bool>> currentModuleState;
-            for (const auto& pair : asfTree->getModules()) {
-                const auto& module = pair.second;
-                currentModuleState[pair.first] = std::make_tuple(
-                    module->getX(), module->getY(), module->getRotated());
-            }
-            
-            // Determine perturbation type
-            double rand = uniformDist(rng);
-            bool perturbSuccess = false;
-            
-            if (rand < 0.3) {
-                // Rotate a random module
-                perturbSuccess = perturbRotateInSymmetryGroup(asfTree, rng, uniformDist);
-            } else if (rand < 0.65) {
-                // Pre-order based perturbation
-                perturbSuccess = perturbPreOrderInSymmetryGroup(asfTree, rng, uniformDist);
-            } else {
-                // In-order based perturbation
-                perturbSuccess = perturbInOrderInSymmetryGroup(asfTree, rng, uniformDist);
-            }
-            
-            if (!perturbSuccess) {
-                continue;
-            }
-            
-            // Pack the tree and validate
-            if (!asfTree->pack() || !asfTree->isSymmetricFeasible()) {
-                // Invalid perturbation, restore state
-                for (auto& pair : asfTree->getModules()) {
-                    auto module = pair.second;
-                    auto state = currentModuleState[pair.first];
-                    module->setPosition(std::get<0>(state), std::get<1>(state));
-                    module->setRotation(std::get<2>(state));
-                }
-                continue;
-            }
-            
-            // Calculate new area
-            int newArea = asfTree->getArea();
-            int deltaCost = newArea - currentArea;
-            
-            // Decide whether to accept
-            bool accept = false;
-            if (deltaCost <= 0) {
-                // Accept improvement
-                accept = true;
-                if (newArea < bestArea) {
-                    bestArea = newArea;
-                    noImprovementCount = 0;
-                    
-                    // Update best solution
-                    for (const auto& pair : asfTree->getModules()) {
-                        const auto& module = pair.second;
-                        bestModuleState[pair.first] = std::make_tuple(
-                            module->getX(), module->getY(), module->getRotated());
-                    }
-                } else {
-                    noImprovementCount++;
-                }
-            } else {
-                // Accept with probability
-                double acceptProb = std::exp(-deltaCost / temperature);
-                accept = uniformDist(rng) < acceptProb;
-                noImprovementCount++;
-            }
-            
-            if (accept) {
-                currentArea = newArea;
-                acceptedInThisPass++;
-            } else {
-                // Rejected, restore state
-                for (auto& pair : asfTree->getModules()) {
-                    auto module = pair.second;
-                    auto state = currentModuleState[pair.first];
-                    module->setPosition(std::get<0>(state), std::get<1>(state));
-                    module->setRotation(std::get<2>(state));
-                }
-            }
-            
-            if (noImprovementCount >= noImprovementLimit) {
-                break;
-            }
-        }
-        
-        // Calculate acceptance ratio
-        double acceptanceRatio = (double)acceptedInThisPass / (iterationsPerTemperature / 2);
-        
-        // Update temperature
-        if (acceptanceRatio > 0.8) {
-            temperature *= coolingRate * 0.9;
-        } else if (acceptanceRatio < 0.1) {
-            temperature *= coolingRate * 1.1;
-        } else {
-            temperature *= coolingRate;
-        }
-        
-        std::cout << "    Symmetry group - Temp: " << temperature 
-                 << ", Area: " << currentArea 
-                 << ", Best: " << bestArea 
-                 << ", AcceptRatio: " << acceptanceRatio 
-                 << std::endl;
-    }
-    
-    // Restore best solution
-    for (auto& pair : asfTree->getModules()) {
-        auto module = pair.second;
-        auto state = bestModuleState[pair.first];
-        module->setPosition(std::get<0>(state), std::get<1>(state));
-        module->setRotation(std::get<2>(state));
-    }
-    
-    // Final packing
-    if (!asfTree->pack()) {
-        std::cerr << "Error: Final packing of symmetry group failed" << std::endl;
-        return false;
-    }
-    
-    return true;
-}
-
-/**
- * Finalizes a symmetry group's contour after internal optimization
- */
-void PlacementSolver::finalizeSymmetryGroupContour(std::shared_ptr<ASFBStarTree> asfTree) {
-    // Find the bounding rectangle of the symmetry group
-    int minX = std::numeric_limits<int>::max();
-    int minY = std::numeric_limits<int>::max();
-    int maxX = 0;
-    int maxY = 0;
-    
-    for (const auto& pair : asfTree->getModules()) {
-        const auto& module = pair.second;
-        minX = std::min(minX, module->getX());
-        minY = std::min(minY, module->getY());
-        maxX = std::max(maxX, module->getX() + module->getWidth());
-        maxY = std::max(maxY, module->getY() + module->getHeight());
-    }
-    
-    // Shift all modules in the group to start at (0,0)
-    for (auto& pair : asfTree->getModules()) {
-        auto module = pair.second;
-        module->setPosition(
-            module->getX() - minX,
-            module->getY() - minY
-        );
-    }
-    
-    // If necessary, update the symmetry axis position
-    auto symmetryGroup = asfTree->getSymmetryGroup();
-    if (symmetryGroup->getType() == SymmetryType::VERTICAL) {
-        double oldAxis = symmetryGroup->getAxisPosition();
-        symmetryGroup->setAxisPosition(oldAxis - minX);
-    } else { // HORIZONTAL
-        double oldAxis = symmetryGroup->getAxisPosition();
-        symmetryGroup->setAxisPosition(oldAxis - minY);
-    }
-    
-    // Re-pack the tree to update contours
-    asfTree->pack();
-}
-
-/**
- * Creates initial solution for just regular modules
- */
-void PlacementSolver::createInitialRegularSolution() {
-    // Create B*-tree for regular modules (if any)
-    regularTree = nullptr;
-    
-    if (!regularModules.empty()) {
-        // Sort regular modules by area (largest first)
-        std::vector<std::pair<std::string, std::shared_ptr<Module>>> sortedModules;
-        for (const auto& pair : regularModules) {
-            sortedModules.push_back(pair);
-        }
-        
-        std::sort(sortedModules.begin(), sortedModules.end(), 
-                 [](const auto& a, const auto& b) {
-                     return a.second->getArea() > b.second->getArea();
-                 });
-        
-        // Create a balanced tree structure
-        if (!sortedModules.empty()) {
-            regularTree = std::make_shared<BStarTreeNode>(sortedModules[0].first);
-            
-            if (sortedModules.size() > 1) {
-                // Create a more balanced tree
-                for (size_t i = 1; i < sortedModules.size(); ++i) {
-                    auto newNode = std::make_shared<BStarTreeNode>(sortedModules[i].first);
-                    
-                    // Use BFS to find a node with available child slot
-                    std::queue<std::shared_ptr<BStarTreeNode>> nodeQueue;
-                    nodeQueue.push(regularTree);
-                    
-                    bool placed = false;
-                    while (!nodeQueue.empty() && !placed) {
-                        auto current = nodeQueue.front();
-                        nodeQueue.pop();
-                        
-                        if (!current->getLeftChild()) {
-                            current->setLeftChild(newNode);
-                            newNode->setParent(current);
-                            placed = true;
-                        } else if (!current->getRightChild()) {
-                            current->setRightChild(newNode);
-                            newNode->setParent(current);
-                            placed = true;
-                        } else {
-                            nodeQueue.push(current->getLeftChild());
-                            nodeQueue.push(current->getRightChild());
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-/**
- * Packs the combined solution (symmetry groups + regular modules)
- */
-bool PlacementSolver::packCombinedSolution() {
-    int currentY = 0;
-    
-    // First, pack all symmetry groups while preserving their internal structure
-    for (auto& pair : symmetryTrees) {
-        // The internal structure of the symmetry group is already fixed
-        // Just position the entire group
-        int minX = std::numeric_limits<int>::max();
-        int minY = std::numeric_limits<int>::max();
-        int maxX = 0;
-        int maxY = 0;
-        
-        // Find the current bounding box
-        for (const auto& modPair : pair.second->getModules()) {
-            auto module = modPair.second;
-            minX = std::min(minX, module->getX());
-            minY = std::min(minY, module->getY());
-            maxX = std::max(maxX, module->getX() + module->getWidth());
-            maxY = std::max(maxY, module->getY() + module->getHeight());
-        }
-        
-        // Calculate shift amount to place at (0, currentY)
-        int deltaX = -minX;
-        int deltaY = currentY - minY;
-        
-        // Update symmetry axis position
-        auto symGroup = pair.second->getSymmetryGroup();
-        if (symGroup->getType() == SymmetryType::VERTICAL) {
-            double oldAxis = symGroup->getAxisPosition();
-            symGroup->setAxisPosition(oldAxis + deltaX);
-        } else {
-            double oldAxis = symGroup->getAxisPosition();
-            symGroup->setAxisPosition(oldAxis + deltaY);
-        }
-        
-        // Shift all modules in the group
-        for (auto& modPair : pair.second->getModules()) {
-            auto module = modPair.second;
-            module->setPosition(
-                module->getX() + deltaX,
-                module->getY() + deltaY
-            );
-        }
-        
-        // Update current Y for next group with spacing
-        currentY = (maxY - minY) + currentY + 10; // 10 units spacing
-    }
-    
-    // Now place regular modules
-    if (!regularModules.empty() && regularTree) {
-        // Use a simple B*-tree packing algorithm
-        std::queue<std::shared_ptr<BStarTreeNode>> nodeQueue;
-        nodeQueue.push(regularTree);
-        
-        while (!nodeQueue.empty()) {
-            auto currentNode = nodeQueue.front();
-            nodeQueue.pop();
-            
-            const std::string& moduleName = currentNode->getModuleName();
-            auto moduleIt = regularModules.find(moduleName);
-            if (moduleIt == regularModules.end()) {
-                continue;
-            }
-            
-            auto module = moduleIt->second;
-            
-            int x = 0, y = currentY;
-            
-            // Calculate position based on B*-tree rules
-            if (currentNode->getParent()) {
-                auto parentName = currentNode->getParent()->getModuleName();
-                auto parentIt = regularModules.find(parentName);
-                if (parentIt != regularModules.end()) {
-                    auto parentModule = parentIt->second;
-                    
-                    if (currentNode->isLeftChild()) {
-                        // Left child: place to the right of parent
-                        x = parentModule->getX() + parentModule->getWidth();
-                        y = parentModule->getY();
-                    } else {
-                        // Right child: place above parent
-                        x = parentModule->getX();
-                        y = parentModule->getY() + parentModule->getHeight();
-                    }
-                }
-            }
-            
-            // Set the module's position
-            module->setPosition(x, y);
-            
-            // Add children to the queue
-            if (currentNode->getLeftChild()) {
-                nodeQueue.push(currentNode->getLeftChild());
-            }
-            if (currentNode->getRightChild()) {
-                nodeQueue.push(currentNode->getRightChild());
-            }
-        }
-    }
-    
-    return true;
-}
-
-/**
- * Perturbs the combined placement (symmetry groups and regular modules)
- */
-bool PlacementSolver::perturbCombinedPlacement (
-    std::mt19937& rng, 
-    std::uniform_real_distribution<double>& uniformDist) {
-    
-    // Decide whether to perturb a regular module or a symmetry group
-    bool perturbRegular = !regularModules.empty() && 
-                         (symmetryTrees.empty() || uniformDist(rng) < 0.5);
-    
-    if (perturbRegular) {
-        // Perturb regular modules
-        double randVal = uniformDist(rng);
-        
-        if (randVal < 0.5) {
-            // Rotate a regular module
-            int index = static_cast<int>(uniformDist(rng) * regularModules.size());
-            auto it = regularModules.begin();
-            std::advance(it, index);
-            
-            it->second->rotate();
-            return true;
-        } else {
-            // Move a regular module
-            // For simplicity, just swap two modules
-            if (regularModules.size() >= 2) {
-                int idx1 = static_cast<int>(uniformDist(rng) * regularModules.size());
-                int idx2;
-                do {
-                    idx2 = static_cast<int>(uniformDist(rng) * regularModules.size());
-                } while (idx2 == idx1);
-                
-                auto it1 = regularModules.begin();
-                auto it2 = regularModules.begin();
-                std::advance(it1, idx1);
-                std::advance(it2, idx2);
-                
-                // Swap positions
-                auto module1 = it1->second;
-                auto module2 = it2->second;
-                
-                int tmpX = module1->getX();
-                int tmpY = module1->getY();
-                module1->setPosition(module2->getX(), module2->getY());
-                module2->setPosition(tmpX, tmpY);
-                
-                return true;
-            }
-        }
-    } else if (!symmetryTrees.empty()) {
-        // Perturb symmetry groups
-        // For simplicity, we'll just move symmetry groups around
-        
-        // Get a list of symmetry groups
-        std::vector<std::string> groupNames;
-        for (const auto& pair : symmetryTrees) {
-            groupNames.push_back(pair.first);
-        }
-        
-        if (groupNames.size() >= 2) {
-            // Swap two symmetry groups
-            int idx1 = static_cast<int>(uniformDist(rng) * groupNames.size());
-            int idx2;
-            do {
-                idx2 = static_cast<int>(uniformDist(rng) * groupNames.size());
-            } while (idx2 == idx1);
-            
-            auto& group1 = symmetryTrees[groupNames[idx1]];
-            auto& group2 = symmetryTrees[groupNames[idx2]];
-            
-            // Find bounding boxes
-            int minX1 = std::numeric_limits<int>::max();
-            int minY1 = std::numeric_limits<int>::max();
-            int minX2 = std::numeric_limits<int>::max();
-            int minY2 = std::numeric_limits<int>::max();
-            
-            for (const auto& pair : group1->getModules()) {
-                auto module = pair.second;
-                minX1 = std::min(minX1, module->getX());
-                minY1 = std::min(minY1, module->getY());
-            }
-            
-            for (const auto& pair : group2->getModules()) {
-                auto module = pair.second;
-                minX2 = std::min(minX2, module->getX());
-                minY2 = std::min(minY2, module->getY());
-            }
-            
-            // Calculate deltas
-            int deltaX1 = minX2 - minX1;
-            int deltaY1 = minY2 - minY1;
-            int deltaX2 = minX1 - minX2;
-            int deltaY2 = minY1 - minY2;
-            
-            // Shift group 1
-            for (auto& pair : group1->getModules()) {
-                auto module = pair.second;
-                module->setPosition(
-                    module->getX() + deltaX1,
-                    module->getY() + deltaY1
-                );
-            }
-            
-            // Update symmetry axis for group 1
-            auto symGroup1 = group1->getSymmetryGroup();
-            if (symGroup1->getType() == SymmetryType::VERTICAL) {
-                double oldAxis = symGroup1->getAxisPosition();
-                symGroup1->setAxisPosition(oldAxis + deltaX1);
-            } else {
-                double oldAxis = symGroup1->getAxisPosition();
-                symGroup1->setAxisPosition(oldAxis + deltaY1);
-            }
-            
-            // Shift group 2
-            for (auto& pair : group2->getModules()) {
-                auto module = pair.second;
-                module->setPosition(
-                    module->getX() + deltaX2,
-                    module->getY() + deltaY2
-                );
-            }
-            
-            // Update symmetry axis for group 2
-            auto symGroup2 = group2->getSymmetryGroup();
-            if (symGroup2->getType() == SymmetryType::VERTICAL) {
-                double oldAxis = symGroup2->getAxisPosition();
-                symGroup2->setAxisPosition(oldAxis + deltaX2);
-            } else {
-                double oldAxis = symGroup2->getAxisPosition();
-                symGroup2->setAxisPosition(oldAxis + deltaY2);
-            }
-            
-            return true;
-        } else if (groupNames.size() == 1 && !regularModules.empty()) {
-            // Move the single symmetry group relative to regular modules
-            auto& group = symmetryTrees[groupNames[0]];
-            
-            // Randomly select a regular module
-            int modIdx = static_cast<int>(uniformDist(rng) * regularModules.size());
-            auto modIt = regularModules.begin();
-            std::advance(modIt, modIdx);
-            auto regModule = modIt->second;
-            
-            // Find bounding box of the group
-            int minX = std::numeric_limits<int>::max();
-            int minY = std::numeric_limits<int>::max();
-            
-            for (const auto& pair : group->getModules()) {
-                auto module = pair.second;
-                minX = std::min(minX, module->getX());
-                minY = std::min(minY, module->getY());
-            }
-            
-            // Calculate deltas to move group next to the regular module
-            int deltaX = regModule->getX() + regModule->getWidth() - minX;
-            int deltaY = regModule->getY() - minY;
-            
-            // Shift the group
-            for (auto& pair : group->getModules()) {
-                auto module = pair.second;
-                module->setPosition(
-                    module->getX() + deltaX,
-                    module->getY() + deltaY
-                );
-            }
-            
-            // Update symmetry axis
-            auto symGroup = group->getSymmetryGroup();
-            if (symGroup->getType() == SymmetryType::VERTICAL) {
-                double oldAxis = symGroup->getAxisPosition();
-                symGroup->setAxisPosition(oldAxis + deltaX);
-            } else {
-                double oldAxis = symGroup->getAxisPosition();
-                symGroup->setAxisPosition(oldAxis + deltaY);
-            }
-            
-            return true;
-        }
-    }
-    
-    return false;
-}
-
-/**
- * Validates a single symmetry group
- */
-bool PlacementSolver::validateSymmetryGroup(std::shared_ptr<ASFBStarTree> asfTree) {
-    return asfTree->isSymmetricFeasible() && !hasOverlapsInSymmetryGroup(asfTree);
-}
-
-/**
- * Checks for overlaps within a symmetry group
- */
-bool PlacementSolver::hasOverlapsInSymmetryGroup(std::shared_ptr<ASFBStarTree> asfTree) {
-    const auto& modules = asfTree->getModules();
-    
-    // Check all pairs of modules for overlaps
-    for (auto it1 = modules.begin(); it1 != modules.end(); ++it1) {
-        auto it2 = it1;
-        ++it2;
-        
-        for (; it2 != modules.end(); ++it2) {
-            if (it1->second->overlaps(*it2->second)) {
-                std::cerr << "Overlap detected within symmetry group between modules: " 
-                         << it1->first << " and " << it2->first << std::endl;
-                return true;
-            }
-        }
-    }
-    
-    return false;
-}
-
-/**
- * Performs rotation perturbation within a symmetry group
- */
-bool PlacementSolver::perturbRotateInSymmetryGroup(
-    std::shared_ptr<ASFBStarTree> asfTree,
-    std::mt19937& rng,
-    std::uniform_real_distribution<double>& uniformDist) {
-    
-    // Select a random module from the symmetry group
-    const auto& modules = asfTree->getModules();
-    if (modules.empty()) return false;
-    
-    std::vector<std::string> moduleNames;
-    for (const auto& pair : modules) {
-        moduleNames.push_back(pair.first);
-    }
-    
-    int index = static_cast<int>(uniformDist(rng) * moduleNames.size());
-    std::string moduleName = moduleNames[index];
-    
-    // Use the ASFBStarTree's rotateModule method which handles symmetry
-    return asfTree->rotateModule(moduleName);
-}
-
-/**
- * Performs pre-order perturbation within a symmetry group
- */
-bool PlacementSolver::perturbPreOrderInSymmetryGroup(
-    std::shared_ptr<ASFBStarTree> asfTree,
-    std::mt19937& rng,
-    std::uniform_real_distribution<double>& uniformDist) {
-    
-    auto root = asfTree->getRoot();
-    if (!root) return false;
-    
-    // Collect nodes in pre-order
-    std::vector<std::shared_ptr<BStarTreeNode>> nodes;
-    collectNodesPreOrder(root, nodes);
-    
-    if (nodes.size() < 2) return false;
-    
-    // Select two random positions
-    int pos1 = static_cast<int>(uniformDist(rng) * nodes.size());
-    int pos2;
-    do {
-        pos2 = static_cast<int>(uniformDist(rng) * nodes.size());
-    } while (pos1 == pos2);
-    
-    auto node1 = nodes[pos1];
-    auto node2 = nodes[pos2];
-    
-    // Check if both nodes represent modules in the same symmetry group
-    if (!asfTree->getModules().count(node1->getModuleName()) ||
-        !asfTree->getModules().count(node2->getModuleName())) {
-        return false;
-    }
-    
-    // Check if swapping would violate symmetry constraints
-    bool node1IsSelf = asfTree->isOnBoundary(node1->getModuleName());
-    bool node2IsSelf = asfTree->isOnBoundary(node2->getModuleName());
-    
-    // Only swap if both are self-symmetric or both are not
-    if (node1IsSelf == node2IsSelf) {
-        // Use ASFBStarTree's swapNodes method which maintains symmetry
-        return asfTree->swapNodes(node1->getModuleName(), node2->getModuleName());
-    }
-    
-    return false;
-}
-
-/**
- * Performs in-order perturbation within a symmetry group
- */
-bool PlacementSolver::perturbInOrderInSymmetryGroup(
-    std::shared_ptr<ASFBStarTree> asfTree,
-    std::mt19937& rng,
-    std::uniform_real_distribution<double>& uniformDist) {
-    
-    auto root = asfTree->getRoot();
-    if (!root) return false;
-    
-    // Collect nodes in in-order
-    std::vector<std::shared_ptr<BStarTreeNode>> nodes;
-    collectNodesInOrder(root, nodes);
-    
-    if (nodes.size() < 2) return false;
-    
-    // Select two random positions
-    int pos1 = static_cast<int>(uniformDist(rng) * nodes.size());
-    int pos2;
-    do {
-        pos2 = static_cast<int>(uniformDist(rng) * nodes.size());
-    } while (pos1 == pos2);
-    
-    auto node1 = nodes[pos1];
-    auto node2 = nodes[pos2];
-    
-    // Check if both nodes represent modules in the same symmetry group
-    if (!asfTree->getModules().count(node1->getModuleName()) ||
-        !asfTree->getModules().count(node2->getModuleName())) {
-        return false;
-    }
-    
-    // Check if swapping would violate symmetry constraints
-    bool node1IsSelf = asfTree->isOnBoundary(node1->getModuleName());
-    bool node2IsSelf = asfTree->isOnBoundary(node2->getModuleName());
-    
-    // Only swap if both are self-symmetric or both are not
-    if (node1IsSelf == node2IsSelf) {
-        // Use ASFBStarTree's swapNodes method which maintains symmetry
-        return asfTree->swapNodes(node1->getModuleName(), node2->getModuleName());
-    }
-    
-    return false;
-}
-
-/**
- * Helper function to collect nodes in pre-order traversal
- */
-void PlacementSolver::collectNodesPreOrder(
-    const std::shared_ptr<BStarTreeNode>& root,
-    std::vector<std::shared_ptr<BStarTreeNode>>& nodes) {
-    
-    if (!root) return;
-    
-    // Pre-order: Root, Left, Right
-    nodes.push_back(root);
-    
-    if (root->getLeftChild()) {
-        collectNodesPreOrder(root->getLeftChild(), nodes);
-    }
-    
-    if (root->getRightChild()) {
-        collectNodesPreOrder(root->getRightChild(), nodes);
-    }
-}
-
-/**
- * Helper function to collect nodes in in-order traversal
- */
-void PlacementSolver::collectNodesInOrder(
-    const std::shared_ptr<BStarTreeNode>& root,
-    std::vector<std::shared_ptr<BStarTreeNode>>& nodes) {
-    
-    if (!root) return;
-    
-    // In-order: Left, Root, Right
-    if (root->getLeftChild()) {
-        collectNodesInOrder(root->getLeftChild(), nodes);
-    }
-    
-    nodes.push_back(root);
-    
-    if (root->getRightChild()) {
-        collectNodesInOrder(root->getRightChild(), nodes);
-    }
 }
 
 int PlacementSolver::getSolutionArea() const {
@@ -1514,4 +1222,14 @@ std::map<std::string, int> PlacementSolver::getStatistics() const {
     stats["width"] = solutionWidth;
     stats["height"] = solutionHeight;
     return stats;
+}
+
+std::shared_ptr<BStarTreeNode>& SimulatedAnnealing::getGlobalTree() {
+    // Assuming we have a reference to the PlacementSolver
+    return solver.getGlobalTree();
+}
+
+std::map<std::string, std::variant<std::shared_ptr<Module>, 
+    std::shared_ptr<SymmetryIslandBlock>>>& SimulatedAnnealing::getGlobalNodes() {
+    return solver.getGlobalNodes();
 }

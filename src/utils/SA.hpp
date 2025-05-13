@@ -14,13 +14,15 @@
 #include "../data_struct/SymmetryConstraint.hpp"
 #include "../data_struct/ASFBStarTree.hpp"
 #include "../data_struct/BStarTreeNode.hpp"
+#include "../data_struct/SymmetryIslandBlock.hpp"
 
 // Enum for different perturbation types
 enum class PerturbationType {
     NONE,
     ROTATE,
     PRE_ORDER,
-    IN_ORDER
+    IN_ORDER,
+    GLOBAL_TREE
 };
 
 // Structure to store module state for efficient reversion
@@ -47,6 +49,7 @@ struct SymmetryGroupState {
 
 class SimulatedAnnealing {
 private:
+
     // Reference to all modules
     std::map<std::string, std::shared_ptr<Module>> allModules;
     
@@ -246,6 +249,23 @@ public:
 
     bool perturbPreOrder();
     bool perturbInOrder();
+
+    // Global B*-tree perturbation methods
+    bool perturbGlobalTree();
+    std::shared_ptr<BStarTreeNode> findNodeInTree(
+        const std::shared_ptr<BStarTreeNode>& root, const std::string& name);
+    bool swapNodesInTree(
+        std::shared_ptr<BStarTreeNode> node1, std::shared_ptr<BStarTreeNode> node2);
+    bool moveNodeInTree(
+        std::shared_ptr<BStarTreeNode> nodeToMove, 
+        std::shared_ptr<BStarTreeNode> newParent,
+        bool asLeftChild);
+    bool rotateGlobalNode(const std::string& nodeName);
+    
+    // Access to global tree and nodes
+    std::shared_ptr<BStarTreeNode>& getGlobalTree();
+    std::map<std::string, std::variant<std::shared_ptr<Module>, 
+        std::shared_ptr<SymmetryIslandBlock>>>& getGlobalNodes();
     
     /**
      * Sets perturbation probabilities

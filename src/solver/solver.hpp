@@ -12,24 +12,36 @@
 #include "../data_struct/BStarTreeNode.hpp"
 #include "../data_struct/ASFBStarTree.hpp"
 #include "../utils/SA.hpp"
+#include "../data_struct/SymmetryIslandBlock.hpp"
 
 class PlacementSolver {
 private:
+    friend class SimulatedAnnealing;
+
     // Regular modules (not part of symmetry groups)
     std::map<std::string, std::shared_ptr<Module>> regularModules;
     
     // Symmetry groups and their modules
     std::vector<std::shared_ptr<SymmetryGroup>> symmetryGroups;
     std::map<std::string, std::shared_ptr<ASFBStarTree>> symmetryTrees;
+
+    // Symmetry islands as blocks for global placement
+    std::vector<std::shared_ptr<SymmetryIslandBlock>> symmetryIslands;
     
-    // B*-tree for regular modules
-    std::shared_ptr<BStarTreeNode> regularTree;
+    // Global B*-tree for overall placement
+    std::shared_ptr<BStarTreeNode> globalTree;
+
+    // Map from node name to either Module or SymmetryIslandBlock
+    std::map<std::string, std::variant<std::shared_ptr<Module>, std::shared_ptr<SymmetryIslandBlock>>> globalNodes;
     
     // All modules (reference to both regular and symmetry modules)
     std::map<std::string, std::shared_ptr<Module>> allModules;
     
     // Mapping from module name to its parent symmetry group
     std::map<std::string, std::shared_ptr<SymmetryGroup>> moduleToGroup;
+    
+    // B*-tree for regular modules
+    std::shared_ptr<BStarTreeNode> regularTree;
     
     // Simulated annealing parameters
     double initialTemperature;
@@ -61,16 +73,49 @@ private:
     int timeLimit;
     
     /**
+     * Creates an initial placement solution
+     */
+    void createInitialSolution();
+    
+    /**
+     * Packs all modules (regular and symmetry groups)
+     * using grid-based packing strategy
+     * @return True if packing succeeded
+     */
+    bool packSolution();
+    
+    /**
+     * Packs regular modules using contour-based placement
+     * 
+     * @param horizontalContour The global horizontal contour
+     * @param verticalContour The global vertical contour
+     * @return True if packing succeeded
+     */
+    bool packRegularModules(std::shared_ptr<Contour> horizontalContour, 
+                           std::shared_ptr<Contour> verticalContour);
+    
+    /**
      * Calculates total placement area
      * @return Total area
      */
     int calculateTotalArea();
+
+    /**
+     * Calculates the area of a symmetry group
+     * 
+     * @param group The symmetry group
+     * @return Total area of all modules in the group
+     */
+    int calculateSymmetryGroupArea(const std::shared_ptr<SymmetryGroup>& group);
     
     /**
      * Checks if there are any overlaps between modules
      * @return True if there are overlaps
      */
     bool hasOverlaps() const;
+
+    // Helper function to check if a position is valid (no overlaps)
+    bool isPositionValid(int x, int y, int width, int height);
     
     /**
      * Validates symmetry constraints
@@ -83,6 +128,16 @@ private:
      * Identifies which modules belong to which symmetry groups
      */
     void initializeModuleGrouping();
+
+    /**
+     * Creates a global B*-tree
+     */
+    void createGlobalBTree();
+    
+    /**
+     * Packs the global B*-tree
+     */
+    bool packGlobalBTree();
     
 public:
     /**
@@ -156,85 +211,6 @@ public:
      * @return True if a valid solution was found, false otherwise
      */
     bool solve();
-
-    /**
-     * Process a single symmetry group with internal SA
-     * 
-     * @param asfTree The symmetry group's ASF-B*-tree
-     * @param startTime The overall start time for time limit tracking
-     * @return True if processing was successful
-     */
-    bool processSymmetryGroupInternally( std::shared_ptr<ASFBStarTree> asfTree,
-                                        const std::chrono::steady_clock::time_point& startTime);
-
-    /**
-     * Finalizes a symmetry group's contour after internal optimization
-     */
-    void finalizeSymmetryGroupContour(std::shared_ptr<ASFBStarTree> asfTree); 
-
-    /**
-     * Perturbs the combined placement (symmetry groups and regular modules)
-     */
-    bool perturbCombinedPlacement( std::mt19937& rng, 
-                                    std::uniform_real_distribution<double>& uniformDist);
-        
-    /**
-     * Creates initial solution for just regular modules
-     */
-    void createInitialRegularSolution();
-
-    /**
-     * Packs the combined solution (symmetry groups + regular modules)
-     */
-    bool packCombinedSolution(); 
-
-    /**
-     * Validates a single symmetry group
-     */
-    bool validateSymmetryGroup(std::shared_ptr<ASFBStarTree> asfTree); 
-
-    /**
-     * Checks for overlaps within a symmetry group
-     */
-    bool hasOverlapsInSymmetryGroup(std::shared_ptr<ASFBStarTree> asfTree);    
-
-    /**
-     * Performs rotation perturbation within a symmetry group
-     */
-    bool perturbRotateInSymmetryGroup(
-        std::shared_ptr<ASFBStarTree> asfTree,
-        std::mt19937& rng,
-        std::uniform_real_distribution<double>& uniformDist);
-
-    /**
-     * Performs pre-order perturbation within a symmetry group
-     */
-    bool perturbPreOrderInSymmetryGroup(
-        std::shared_ptr<ASFBStarTree> asfTree,
-        std::mt19937& rng,
-        std::uniform_real_distribution<double>& uniformDist);     
-
-    /**
-     * Performs in-order perturbation within a symmetry group
-     */
-    bool perturbInOrderInSymmetryGroup(
-        std::shared_ptr<ASFBStarTree> asfTree,
-        std::mt19937& rng,
-        std::uniform_real_distribution<double>& uniformDist); 
-
-    /**
-     * Helper function to collect nodes in pre-order traversal
-     */
-    void collectNodesPreOrder(
-        const std::shared_ptr<BStarTreeNode>& root,
-        std::vector<std::shared_ptr<BStarTreeNode>>& nodes); 
-        
-    /**
-     * Helper function to collect nodes in in-order traversal
-     */
-    void collectNodesInOrder(
-        const std::shared_ptr<BStarTreeNode>& root,
-        std::vector<std::shared_ptr<BStarTreeNode>>& nodes);
     
     /**
      * Gets the solution area
@@ -256,4 +232,11 @@ public:
      * @return Map of statistic name to value
      */
     std::map<std::string, int> getStatistics() const;
+
+    std::shared_ptr<BStarTreeNode>& getGlobalTree() { return globalTree; }
+    
+    std::map<std::string, std::variant<std::shared_ptr<Module>, 
+        std::shared_ptr<SymmetryIslandBlock>>>& getGlobalNodes() { 
+        return globalNodes; 
+    }
 };

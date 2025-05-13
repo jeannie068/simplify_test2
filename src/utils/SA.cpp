@@ -372,10 +372,20 @@ bool SimulatedAnnealing::perturb() {
     // Save current state before perturbation
     saveCurrentState();
     
-    // Choose perturbation type - only use rotation, pre-order, and in-order
+    // Choose perturbation type
     double randVal = uniformDist(rng);
     bool success = false;
     
+    // First try to perturb the global tree if it exists
+    if (randVal < 0.6 && getGlobalTree()) { // 60% chance to use global tree perturbation
+        success = perturbGlobalTree();
+        if (success) {
+            lastPerturbation = PerturbationType::GLOBAL_TREE;
+            return packSolution();
+        }
+    }
+    
+    // Fall back to other perturbations if global tree perturbation failed or wasn't selected
     if (randVal < 0.3) {
         // Rotation perturbation (30% probability)
         success = perturbRotate();
@@ -834,6 +844,208 @@ bool SimulatedAnnealing::perturbConvertSymmetryType() {
     
     // Convert symmetry type
     return asfTree->convertSymmetryType();
+}
+
+
+bool SimulatedAnnealing::perturbGlobalTree() {
+    auto& globalTree = getGlobalTree();
+    auto& globalNodes = getGlobalNodes();
+    
+    if (!globalTree || globalNodes.empty()) {
+        return false;
+    }
+    
+    // Choose a random perturbation type
+    double randVal = uniformDist(rng);
+    
+    if (randVal < 0.3) {
+        // Rotate a node
+        std::vector<std::string> nodeNames;
+        for (const auto& pair : globalNodes) {
+            nodeNames.push_back(pair.first);
+        }
+        
+        if (nodeNames.empty()) return false;
+        
+        int idx = static_cast<int>(uniformDist(rng) * nodeNames.size());
+        std::string nodeName = nodeNames[idx];
+        
+        return rotateGlobalNode(nodeName);
+    } 
+    else if (randVal < 0.65) {
+        // Swap two nodes in the tree
+        std::vector<std::string> nodeNames;
+        for (const auto& pair : globalNodes) {
+            nodeNames.push_back(pair.first);
+        }
+        
+        if (nodeNames.size() < 2) return false;
+        
+        // Choose two random nodes
+        int idx1 = static_cast<int>(uniformDist(rng) * nodeNames.size());
+        int idx2;
+        do {
+            idx2 = static_cast<int>(uniformDist(rng) * nodeNames.size());
+        } while (idx2 == idx1);
+        
+        std::string name1 = nodeNames[idx1];
+        std::string name2 = nodeNames[idx2];
+        
+        // Track which modules were perturbed
+        perturbedModule1 = name1;
+        perturbedModule2 = name2;
+        
+        // Find the nodes in the tree
+        std::shared_ptr<BStarTreeNode> node1 = findNodeInTree(globalTree, name1);
+        std::shared_ptr<BStarTreeNode> node2 = findNodeInTree(globalTree, name2);
+        
+        if (node1 && node2) {
+            return swapNodesInTree(node1, node2);
+        }
+    }
+    else {
+        // Move a subtree
+        std::vector<std::string> nodeNames;
+        for (const auto& pair : globalNodes) {
+            nodeNames.push_back(pair.first);
+        }
+        
+        if (nodeNames.size() < 2) return false;
+        
+        // Choose two random nodes
+        int idx1 = static_cast<int>(uniformDist(rng) * nodeNames.size());
+        int idx2;
+        do {
+            idx2 = static_cast<int>(uniformDist(rng) * nodeNames.size());
+        } while (idx2 == idx1);
+        
+        std::string name1 = nodeNames[idx1];
+        std::string name2 = nodeNames[idx2];
+        
+        // Track which modules were perturbed
+        perturbedModule1 = name1;
+        perturbedModule2 = name2;
+        
+        // Find the nodes in the tree
+        std::shared_ptr<BStarTreeNode> nodeToMove = findNodeInTree(globalTree, name1);
+        std::shared_ptr<BStarTreeNode> newParent = findNodeInTree(globalTree, name2);
+        
+        if (nodeToMove && newParent && nodeToMove != globalTree) {
+            return moveNodeInTree(nodeToMove, newParent, uniformDist(rng) < 0.5);
+        }
+    }
+    
+    return false;
+}
+
+std::shared_ptr<BStarTreeNode> SimulatedAnnealing::findNodeInTree(
+    const std::shared_ptr<BStarTreeNode>& root, const std::string& name) {
+    if (!root) return nullptr;
+    if (root->getModuleName() == name) return root;
+    
+    auto leftResult = findNodeInTree(root->getLeftChild(), name);
+    if (leftResult) return leftResult;
+    
+    return findNodeInTree(root->getRightChild(), name);
+}
+
+bool SimulatedAnnealing::swapNodesInTree(
+    std::shared_ptr<BStarTreeNode> node1, std::shared_ptr<BStarTreeNode> node2) {
+    if (!node1 || !node2 || node1 == node2) return false;
+    
+    auto& globalNodes = getGlobalNodes();
+    
+    // Swap the objects in globalNodes
+    if (globalNodes.find(node1->getModuleName()) != globalNodes.end() &&
+        globalNodes.find(node2->getModuleName()) != globalNodes.end()) {
+        std::swap(globalNodes[node1->getModuleName()], globalNodes[node2->getModuleName()]);
+        return true;
+    }
+    
+    return false;
+}
+
+bool SimulatedAnnealing::moveNodeInTree(
+    std::shared_ptr<BStarTreeNode> nodeToMove, 
+    std::shared_ptr<BStarTreeNode> newParent,
+    bool asLeftChild) {
+    if (!nodeToMove || !newParent || nodeToMove == newParent) return false;
+    
+    // Ensure we're not creating a cycle
+    auto current = newParent;
+    while (current) {
+        if (current == nodeToMove) return false;
+        current = current->getParent();
+    }
+    
+    // Remove the node from its current parent
+    auto oldParent = nodeToMove->getParent();
+    if (oldParent) {
+        if (oldParent->getLeftChild() == nodeToMove) {
+            oldParent->setLeftChild(nullptr);
+        } else if (oldParent->getRightChild() == nodeToMove) {
+            oldParent->setRightChild(nullptr);
+        }
+    }
+    
+    nodeToMove->setParent(newParent);
+    
+    // Attach to new parent
+    if (asLeftChild) {
+        auto oldChild = newParent->getLeftChild();
+        newParent->setLeftChild(nodeToMove);
+        
+        // If there was already a child there, make it a child of the moved node
+        if (oldChild) {
+            if (!nodeToMove->getLeftChild()) {
+                nodeToMove->setLeftChild(oldChild);
+                oldChild->setParent(nodeToMove);
+            } else if (!nodeToMove->getRightChild()) {
+                nodeToMove->setRightChild(oldChild);
+                oldChild->setParent(nodeToMove);
+            }
+        }
+    } else {
+        auto oldChild = newParent->getRightChild();
+        newParent->setRightChild(nodeToMove);
+        
+        // If there was already a child there, make it a child of the moved node
+        if (oldChild) {
+            if (!nodeToMove->getLeftChild()) {
+                nodeToMove->setLeftChild(oldChild);
+                oldChild->setParent(nodeToMove);
+            } else if (!nodeToMove->getRightChild()) {
+                nodeToMove->setRightChild(oldChild);
+                oldChild->setParent(nodeToMove);
+            }
+        }
+    }
+    
+    return true;
+}
+
+bool SimulatedAnnealing::rotateGlobalNode(const std::string& nodeName) {
+    auto& globalNodes = getGlobalNodes();
+    auto it = globalNodes.find(nodeName);
+    
+    if (it == globalNodes.end()) return false;
+    
+    // Track which module was perturbed
+    perturbedModule1 = nodeName;
+    
+    // Rotate the module or island
+    return std::visit([](auto&& arg) -> bool {
+        using T = std::decay_t<decltype(arg)>;
+        if constexpr (std::is_same_v<T, std::shared_ptr<Module>>) {
+            arg->rotate();
+            return true;
+        } else if constexpr (std::is_same_v<T, std::shared_ptr<SymmetryIslandBlock>>) {
+            arg->rotate();
+            return true;
+        } else {
+            return false;
+        }
+    }, it->second);
 }
 
 void SimulatedAnnealing::revertPerturbation() {

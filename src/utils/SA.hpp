@@ -1,69 +1,290 @@
-// SA.hpp
+/**
+ * SimulatedAnnealing.hpp
+ * 
+ * A generic simulated annealing algorithm implementation that can be used
+ * for various optimization problems including placement.
+ */
+
 #pragma once
 
 #include <memory>
 #include <random>
-#include <cmath>
 #include <functional>
-#include <vector>
-#include <string>
 #include <chrono>
 #include <map>
-#include <unordered_map>
-#include "../data_struct/Module.hpp"
-#include "../data_struct/SymmetryConstraint.hpp"
-#include "../data_struct/ASFBStarTree.hpp"
-#include "../data_struct/BStarTreeNode.hpp"
-#include "../data_struct/SymmetryIslandBlock.hpp"
+#include <string>
+#include <vector>
+#include <iostream>
 
-// Enum for different perturbation types
-enum class PerturbationType {
-    NONE,
-    ROTATE,
-    PRE_ORDER,
-    IN_ORDER,
-    GLOBAL_TREE
-};
-
-// Structure to store module state for efficient reversion
-struct ModuleState {
-    int x;
-    int y;
-    bool rotated;
-    
-    // Add default constructor to fix compilation error
-    ModuleState() : x(0), y(0), rotated(false) {}
-    ModuleState(int x, int y, bool rotated) : x(x), y(y), rotated(rotated) {}
-};
-
-// Structure to store symmetry group state
-struct SymmetryGroupState {
-    double axisPosition;
-    SymmetryType type;
-    
-    // Add default constructor to fix compilation error
-    SymmetryGroupState() : axisPosition(0.0), type(SymmetryType::VERTICAL) {}
-    SymmetryGroupState(double axisPosition, SymmetryType type) 
-        : axisPosition(axisPosition), type(type) {}
-};
-
+/**
+ * A generic simulated annealing algorithm that can be applied to various optimization problems.
+ * Template parameters:
+ * - SolutionType: Type representing the solution (e.g., placement configuration)
+ * - CostType: Type for the cost function (usually int or double)
+ */
+template<typename SolutionType, typename CostType = double>
 class SimulatedAnnealing {
+public:
+    // Define function types for cost calculation and perturbation
+    using CostFunction = std::function<CostType(const SolutionType&)>;
+    using PerturbFunction = std::function<bool(SolutionType&)>;
+    using SaveFunction = std::function<void(const SolutionType&, SolutionType&)>;
+    using RestoreFunction = std::function<void(SolutionType&, const SolutionType&)>;
+    using ValidationFunction = std::function<bool(const SolutionType&)>;
+    
+    /**
+     * Constructor
+     * 
+     * @param initialSolution Initial solution
+     * @param costFunction Function to calculate the cost of a solution
+     * @param perturbFunction Function to perturb a solution
+     * @param saveSolution Function to save a solution
+     * @param restoreSolution Function to restore a solution
+     * @param validateSolution Function to validate a solution
+     * @param initialTemp Initial temperature
+     * @param finalTemp Final temperature
+     * @param coolRate Cooling rate
+     * @param iterations Iterations per temperature
+     * @param noImprovementLimit Maximum number of iterations without improvement
+     * @param timeLimit Time limit in seconds
+     */
+    SimulatedAnnealing(
+        SolutionType& initialSolution,
+        CostFunction costFunction,
+        PerturbFunction perturbFunction,
+        SaveFunction saveSolution,
+        RestoreFunction restoreSolution,
+        ValidationFunction validateSolution,
+        double initialTemp = 1000.0,
+        double finalTemp = 0.1,
+        double coolRate = 0.98,
+        int iterations = 300,
+        int noImprovementLimit = 3000,
+        int timeLimit = 290)
+        : currentSolution(initialSolution),
+          costFn(costFunction),
+          perturbFn(perturbFunction),
+          saveFn(saveSolution),
+          restoreFn(restoreSolution),
+          validateFn(validateSolution),
+          initialTemperature(initialTemp),
+          finalTemperature(finalTemp),
+          coolingRate(coolRate),
+          iterationsPerTemperature(iterations),
+          noImprovementLimit(noImprovementLimit),
+          timeLimit(timeLimit),
+          uniformDist(0.0, 1.0),
+          totalIterations(0),
+          acceptedMoves(0),
+          rejectedMoves(0),
+          noImprovementCount(0)
+    {
+        // Initialize random number generator
+        rng.seed(static_cast<unsigned int>(std::time(nullptr)));
+        
+        // Save initial solution as the best
+        bestCost = costFn(currentSolution);
+        saveFn(currentSolution, bestSolution);
+    }
+    
+    /**
+     * Sets random seed for reproducibility
+     * 
+     * @param seed Random seed
+     */
+    void setSeed(unsigned int seed) {
+        rng.seed(seed);
+    }
+    
+    /**
+     * Sets time limit
+     * 
+     * @param seconds Time limit in seconds
+     */
+    void setTimeLimit(int seconds) {
+        timeLimit = seconds;
+    }
+    
+    /**
+     * Main optimization function that runs the simulated annealing algorithm
+     * 
+     * @return Best solution found
+     */
+    SolutionType optimize() {
+        double temperature = initialTemperature;
+        noImprovementCount = 0;
+        totalIterations = 0;
+        acceptedMoves = 0;
+        rejectedMoves = 0;
+        startTime = std::chrono::steady_clock::now();
+        
+        // Calculate initial cost
+        currentCost = costFn(currentSolution);
+        
+        std::cout << "Starting SA with initial cost: " << currentCost << std::endl;
+        
+        // Main annealing loop
+        while (temperature > finalTemperature && 
+               noImprovementCount < noImprovementLimit && 
+               !isTimeLimitReached()) {
+            
+            int acceptedInPass = 0;
+            int totalInPass = 0;
+            
+            // Iterations at current temperature
+            for (int i = 0; i < iterationsPerTemperature && !isTimeLimitReached(); ++i) {
+                // Save current solution before perturbation
+                SolutionType tempSolution;
+                saveFn(currentSolution, tempSolution);
+                
+                // Perform perturbation
+                if (!perturbFn(currentSolution)) {
+                    continue;
+                }
+                
+                totalInPass++;
+                
+                // Validate solution
+                bool isValid = validateFn(currentSolution);
+                
+                if (isValid) {
+                    // Calculate new cost
+                    CostType newCost = costFn(currentSolution);
+                    CostType costDiff = newCost - currentCost;
+                    
+                    // Accept or reject
+                    if (acceptMove(costDiff, temperature)) {
+                        // Accept the perturbation
+                        currentCost = newCost;
+                        acceptedMoves++;
+                        acceptedInPass++;
+                        
+                        // Update best solution if improved
+                        if (newCost < bestCost) {
+                            bestCost = newCost;
+                            saveFn(currentSolution, bestSolution);
+                            noImprovementCount = 0;
+                            
+                            std::cout << "New best cost found: " << bestCost << std::endl;
+                        } else {
+                            noImprovementCount++;
+                        }
+                    } else {
+                        // Reject the perturbation
+                        restoreFn(currentSolution, tempSolution);
+                        rejectedMoves++;
+                        noImprovementCount++;
+                    }
+                } else {
+                    // Invalid solution, revert the perturbation
+                    restoreFn(currentSolution, tempSolution);
+                    rejectedMoves++;
+                }
+                
+                totalIterations++;
+                
+                // Periodically output stats
+                if (totalIterations % 100 == 0) {
+                    std::cout << "Iteration: " << totalIterations 
+                              << ", Temperature: " << temperature 
+                              << ", Current cost: " << currentCost 
+                              << ", Best cost: " << bestCost 
+                              << std::endl;
+                }
+            }
+            
+            // Calculate acceptance ratio
+            double acceptanceRatio = (totalInPass > 0) ? 
+                static_cast<double>(acceptedInPass) / totalInPass : 0.0;
+            
+            // Adaptive cooling schedule
+            if (acceptanceRatio > 0.6) {
+                // Too many acceptances, cool faster
+                temperature *= coolingRate * 0.8;
+            } else if (acceptanceRatio < 0.1) {
+                // Too few acceptances, cool slower
+                temperature *= coolingRate * 1.1;
+                if (temperature > initialTemperature) {
+                    temperature = initialTemperature;
+                }
+            } else {
+                // Normal cooling
+                temperature *= coolingRate;
+            }
+            
+            // If stuck in a bad local minimum, consider reheating
+            if (acceptanceRatio < 0.05 && noImprovementCount > noImprovementLimit / 2) {
+                // Reheat to escape local minimum
+                temperature = std::min(initialTemperature * 0.5, temperature * 5.0);
+                std::cout << "Reheating to escape local minimum. New temperature: " << temperature << std::endl;
+                
+                // Consider reverting to best solution to reset path
+                if (noImprovementCount > noImprovementLimit * 0.8) {
+                    restoreFn(currentSolution, bestSolution);
+                    currentCost = bestCost;
+                    std::cout << "Restoring best solution to reset path. Cost: " << bestCost << std::endl;
+                }
+            }
+            
+            std::cout << "Temperature: " << temperature 
+                      << ", Best cost: " << bestCost 
+                      << ", Current cost: " << currentCost 
+                      << ", No improvement: " << noImprovementCount 
+                      << ", Acceptance ratio: " << acceptanceRatio 
+                      << std::endl;
+        }
+        
+        // Restore best solution
+        restoreFn(currentSolution, bestSolution);
+        
+        std::cout << "Simulated annealing completed." << std::endl;
+        std::cout << "Final cost: " << bestCost << std::endl;
+        std::cout << "Total iterations: " << totalIterations << std::endl;
+        std::cout << "Accepted moves: " << acceptedMoves << std::endl;
+        std::cout << "Rejected moves: " << rejectedMoves << std::endl;
+        
+        return bestSolution;
+    }
+    
+    /**
+     * Gets the best cost found
+     * 
+     * @return Best cost
+     */
+    CostType getBestCost() const {
+        return bestCost;
+    }
+    
+    /**
+     * Gets statistics about the annealing process
+     * 
+     * @return Map of statistic name to value
+     */
+    std::map<std::string, int> getStatistics() const {
+        std::map<std::string, int> stats;
+        stats["totalIterations"] = totalIterations;
+        stats["acceptedMoves"] = acceptedMoves;
+        stats["rejectedMoves"] = rejectedMoves;
+        stats["noImprovementCount"] = noImprovementCount;
+        
+        auto currentTime = std::chrono::steady_clock::now();
+        stats["elapsedTimeSeconds"] = static_cast<int>(std::chrono::duration_cast<std::chrono::seconds>(
+            currentTime - startTime).count());
+        
+        return stats;
+    }
+    
 private:
-
-    // Reference to all modules
-    std::map<std::string, std::shared_ptr<Module>> allModules;
+    // Current and best solutions
+    SolutionType currentSolution;
+    SolutionType bestSolution;
     
-    // Regular modules (not part of symmetry groups)
-    std::map<std::string, std::shared_ptr<Module>> regularModules;
-    
-    // Symmetry trees for symmetry groups
-    std::map<std::string, std::shared_ptr<ASFBStarTree>> symmetryTrees;
-    
-    // B*-tree for regular modules
-    std::shared_ptr<BStarTreeNode> regularTree;
-    
-    // Mapping from module name to its parent symmetry group
-    std::map<std::string, std::shared_ptr<SymmetryGroup>> moduleToGroup;
+    // Function objects
+    CostFunction costFn;
+    PerturbFunction perturbFn;
+    SaveFunction saveFn;
+    RestoreFunction restoreFn;
+    ValidationFunction validateFn;
     
     // Simulated annealing parameters
     double initialTemperature;
@@ -71,25 +292,15 @@ private:
     double coolingRate;
     int iterationsPerTemperature;
     int noImprovementLimit;
-    int timeLimit; // in seconds
+    int timeLimit;
     
-    // Random number generation - make both mutable to fix const method issue
+    // Current and best costs
+    CostType currentCost;
+    CostType bestCost;
+    
+    // Random number generation - make both mutable to use in const methods
     mutable std::mt19937 rng;
     mutable std::uniform_real_distribution<double> uniformDist;
-    
-    // Current and best solutions
-    int currentArea;
-    int bestArea;
-    std::map<std::string, ModuleState> bestSolution;
-    std::map<std::string, SymmetryGroupState> bestSymmetryState;
-    
-    // Last perturbation details for efficient reversion
-    PerturbationType lastPerturbation;
-    std::string perturbedModule1;
-    std::string perturbedModule2;
-    std::string perturbedSymGroup;
-    std::map<std::string, ModuleState> preperturbationState;
-    std::map<std::string, SymmetryGroupState> preperturbationSymState;
     
     // Statistics
     int totalIterations;
@@ -98,220 +309,33 @@ private:
     int noImprovementCount;
     std::chrono::steady_clock::time_point startTime;
     
-    // Perturbation probabilities
-    double probRotate;
-    double probMove;
-    double probSwap;
-    double probChangeRep;
-    double probConvertSym;
-    
-    // Cost function weights
-    double areaWeight;
-    double wirelengthWeight;
-    
-    /**
-     * Packs the solution
-     * @return True if packing succeeded without overlaps
-     */
-    bool packSolution();
-    
-    /**
-     * Packs regular modules
-     * @param startX Starting X coordinate for regular modules
-     * @param startY Starting Y coordinate for regular modules
-     * @return True if packing succeeded
-     */
-    bool packRegularModules(int startX, int startY);
-    
-    /**
-     * Calculates the area of the current solution
-     * @return Total area
-     */
-    int calculateArea();
-    
-    /**
-     * Checks if there are any overlaps between modules
-     * @return True if overlaps exist
-     */
-    bool hasOverlaps() const;
-    
-    /**
-     * Validates symmetry constraints
-     * @return True if all symmetry constraints are valid
-     */
-    bool validateSymmetryConstraints() const;
-    
-    /**
-     * Performs a random perturbation
-     * @return True if perturbation succeeded
-     */
-    bool perturb();
-    
-    /**
-     * Performs a rotation perturbation
-     * @return True if perturbation succeeded
-     */
-    bool perturbRotate();
-    
-    /**
-     * Performs a move perturbation
-     * @return True if perturbation succeeded
-     */
-    bool perturbMove();
-    
-    /**
-     * Performs a swap perturbation
-     * @return True if perturbation succeeded
-     */
-    bool perturbSwap();
-    
-    /**
-     * Performs a change representative perturbation
-     * @return True if perturbation succeeded
-     */
-    bool perturbChangeRepresentative();
-    
-    /**
-     * Performs a convert symmetry type perturbation
-     * @return True if perturbation succeeded
-     */
-    bool perturbConvertSymmetryType();
-    
-    /**
-     * Reverts the last perturbation
-     */
-    void revertPerturbation();
-    
     /**
      * Decides whether to accept a move based on cost difference and temperature
+     * 
      * @param costDiff Cost difference (new - old)
      * @param temp Current temperature
      * @return True if move should be accepted
      */
-    bool acceptMove(int costDiff, double temp) const;
-    
-    /**
-     * Saves the current solution as the best solution
-     */
-    void saveBestSolution();
-    
-    /**
-     * Restores the best solution
-     */
-    void restoreBestSolution();
-    
-    /**
-     * Saves the current state before perturbation
-     */
-    void saveCurrentState();
+    bool acceptMove(CostType costDiff, double temp) const {
+        // Always accept improvements
+        if (costDiff <= 0) {
+            return true;
+        }
+        
+        // Accept worsening moves with probability e^(-costDiff/temp)
+        double probability = std::exp(-static_cast<double>(costDiff) / temp);
+        return uniformDist(rng) < probability;
+    }
     
     /**
      * Checks if time limit has been reached
+     * 
      * @return True if time limit reached
      */
-    bool isTimeLimitReached() const;
-
-    void collectNodesPreOrder(const std::shared_ptr<BStarTreeNode>& root, 
-                             std::vector<std::shared_ptr<BStarTreeNode>>& nodes);
-    void collectNodesInOrder(const std::shared_ptr<BStarTreeNode>& root, 
-                            std::vector<std::shared_ptr<BStarTreeNode>>& nodes);
-    void swapTreeNodes(const std::shared_ptr<BStarTreeNode>& node1, 
-                      const std::shared_ptr<BStarTreeNode>& node2);
-
-public:
-    /**
-     * Constructor
-     * @param allModules All modules in the design
-     * @param regularModules Regular modules (not part of symmetry groups)
-     * @param symmetryTrees Symmetry trees for symmetry groups
-     * @param regularTree B*-tree for regular modules
-     * @param moduleToGroup Mapping from module name to symmetry group
-     * @param initialTemp Initial temperature
-     * @param finalTemp Final temperature
-     * @param coolRate Cooling rate
-     * @param iterations Iterations per temperature
-     * @param noImprovementLimit No improvement limit
-     * @param timeLimit Time limit in seconds
-     */
-    SimulatedAnnealing(
-        const std::map<std::string, std::shared_ptr<Module>>& allModules,
-        const std::map<std::string, std::shared_ptr<Module>>& regularModules,
-        const std::map<std::string, std::shared_ptr<ASFBStarTree>>& symmetryTrees,
-        std::shared_ptr<BStarTreeNode> regularTree,
-        const std::map<std::string, std::shared_ptr<SymmetryGroup>>& moduleToGroup,
-        double initialTemp = 1000.0,
-        double finalTemp = 0.1,
-        double coolRate = 0.98,
-        int iterations = 300,
-        int noImprovementLimit = 3000,
-        int timeLimit = 290
-    );
-
-    bool perturbPreOrder();
-    bool perturbInOrder();
-
-    // Global B*-tree perturbation methods
-    bool perturbGlobalTree();
-    std::shared_ptr<BStarTreeNode> findNodeInTree(
-        const std::shared_ptr<BStarTreeNode>& root, const std::string& name);
-    bool swapNodesInTree(
-        std::shared_ptr<BStarTreeNode> node1, std::shared_ptr<BStarTreeNode> node2);
-    bool moveNodeInTree(
-        std::shared_ptr<BStarTreeNode> nodeToMove, 
-        std::shared_ptr<BStarTreeNode> newParent,
-        bool asLeftChild);
-    bool rotateGlobalNode(const std::string& nodeName);
-    
-    // Access to global tree and nodes
-    std::shared_ptr<BStarTreeNode>& getGlobalTree();
-    std::map<std::string, std::variant<std::shared_ptr<Module>, 
-        std::shared_ptr<SymmetryIslandBlock>>>& getGlobalNodes();
-    
-    /**
-     * Sets perturbation probabilities
-     * @param rotate Probability of rotation
-     * @param move Probability of move
-     * @param swap Probability of swap
-     * @param changeRep Probability of changing representative
-     * @param convertSym Probability of converting symmetry type
-     */
-    void setPerturbationProbabilities(double rotate, double move, double swap,
-                                     double changeRep, double convertSym);
-    
-    /**
-     * Sets cost function weights
-     * @param area Weight for area
-     * @param wirelength Weight for wirelength
-     */
-    void setCostWeights(double area, double wirelength);
-    
-    /**
-     * Sets random seed
-     * @param seed Random seed
-     */
-    void setSeed(unsigned int seed);
-    
-    /**
-     * Sets time limit
-     * @param seconds Time limit in seconds
-     */
-    void setTimeLimit(int seconds);
-    
-    /**
-     * Runs the simulated annealing algorithm
-     * @return True if a valid solution was found
-     */
-    bool run();
-    
-    /**
-     * Gets the best area found
-     * @return Best area
-     */
-    int getBestArea() const;
-    
-    /**
-     * Gets statistics about the annealing process
-     * @return Map of statistic name to value
-     */
-    std::map<std::string, int> getStatistics() const;
+    bool isTimeLimitReached() const {
+        auto currentTime = std::chrono::steady_clock::now();
+        auto elapsedSeconds = std::chrono::duration_cast<std::chrono::seconds>(
+            currentTime - startTime).count();
+        return elapsedSeconds >= timeLimit;
+    }
 };

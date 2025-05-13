@@ -1,47 +1,32 @@
-// PlacementSolver.hpp
+/**
+ * solver.hpp
+ * 
+ * This file defines the PlacementSolver class which orchestrates the overall
+ * placement algorithm using the new modular architecture.
+ */
+
 #pragma once
 
 #include <memory>
 #include <vector>
 #include <map>
 #include <string>
-#include <unordered_set>
-#include <unordered_map>
+#include <random>
+#include <variant>
+#include <chrono>
+
 #include "../data_struct/Module.hpp"
 #include "../data_struct/SymmetryConstraint.hpp"
 #include "../data_struct/BStarTreeNode.hpp"
 #include "../data_struct/ASFBStarTree.hpp"
-#include "../utils/SA.hpp"
 #include "../data_struct/SymmetryIslandBlock.hpp"
+#include "../utils/PlacementModel.hpp"
+#include "../utils/SA.hpp"
 
 class PlacementSolver {
 private:
-    friend class SimulatedAnnealing;
-
-    // Regular modules (not part of symmetry groups)
-    std::map<std::string, std::shared_ptr<Module>> regularModules;
-    
-    // Symmetry groups and their modules
-    std::vector<std::shared_ptr<SymmetryGroup>> symmetryGroups;
-    std::map<std::string, std::shared_ptr<ASFBStarTree>> symmetryTrees;
-
-    // Symmetry islands as blocks for global placement
-    std::vector<std::shared_ptr<SymmetryIslandBlock>> symmetryIslands;
-    
-    // Global B*-tree for overall placement
-    std::shared_ptr<BStarTreeNode> globalTree;
-
-    // Map from node name to either Module or SymmetryIslandBlock
-    std::map<std::string, std::variant<std::shared_ptr<Module>, std::shared_ptr<SymmetryIslandBlock>>> globalNodes;
-    
-    // All modules (reference to both regular and symmetry modules)
-    std::map<std::string, std::shared_ptr<Module>> allModules;
-    
-    // Mapping from module name to its parent symmetry group
-    std::map<std::string, std::shared_ptr<SymmetryGroup>> moduleToGroup;
-    
-    // B*-tree for regular modules
-    std::shared_ptr<BStarTreeNode> regularTree;
+    // Placement model containing all solution data
+    PlacementModel model;
     
     // Simulated annealing parameters
     double initialTemperature;
@@ -61,13 +46,10 @@ private:
     double areaWeight;
     double wirelengthWeight;
     
-    // Random seed
+    // Random seed and generator
     unsigned int randomSeed;
-    
-    // Statistics
-    int totalArea;
-    int solutionWidth;
-    int solutionHeight;
+    std::mt19937 rng;
+    std::uniform_real_distribution<double> uniformDist;
     
     // Time limit in seconds
     int timeLimit;
@@ -78,66 +60,61 @@ private:
     void createInitialSolution();
     
     /**
-     * Packs all modules (regular and symmetry groups)
-     * using grid-based packing strategy
-     * @return True if packing succeeded
-     */
-    bool packSolution();
-    
-    /**
-     * Packs regular modules using contour-based placement
+     * Creates an initial ASF-B*-tree for a symmetry group
      * 
-     * @param horizontalContour The global horizontal contour
-     * @param verticalContour The global vertical contour
-     * @return True if packing succeeded
+     * @param asfTree The ASF-B*-tree to initialize
      */
-    bool packRegularModules(std::shared_ptr<Contour> horizontalContour, 
-                           std::shared_ptr<Contour> verticalContour);
+    void createInitialASFBTree(std::shared_ptr<ASFBStarTree> asfTree);
     
     /**
-     * Calculates total placement area
-     * @return Total area
+     * Creates a global B*-tree for overall placement
      */
-    int calculateTotalArea();
-
-    /**
-     * Calculates the area of a symmetry group
-     * 
-     * @param group The symmetry group
-     * @return Total area of all modules in the group
-     */
-    int calculateSymmetryGroupArea(const std::shared_ptr<SymmetryGroup>& group);
-    
-    /**
-     * Checks if there are any overlaps between modules
-     * @return True if there are overlaps
-     */
-    bool hasOverlaps() const;
-
-    // Helper function to check if a position is valid (no overlaps)
-    bool isPositionValid(int x, int y, int width, int height);
-    
-    /**
-     * Validates symmetry constraints
-     * @return True if all symmetry constraints are valid
-     */
-    bool validateSymmetryConstraints() const;
+    void createGlobalBTree();
     
     /**
      * Initializes module grouping
      * Identifies which modules belong to which symmetry groups
      */
     void initializeModuleGrouping();
-
-    /**
-     * Creates a global B*-tree
-     */
-    void createGlobalBTree();
     
     /**
-     * Packs the global B*-tree
+     * Performs a random perturbation on the current solution
+     * 
+     * @return True if perturbation succeeded
      */
-    bool packGlobalBTree();
+    bool performRandomPerturbation();
+    
+    /**
+     * Cost function for the placement
+     * 
+     * @param model The placement model
+     * @return Total cost (mainly area)
+     */
+    int calculateCost(const PlacementModel& model);
+    
+    /**
+     * Saves the current solution
+     * 
+     * @param source Source solution
+     * @param destination Destination to save to
+     */
+    void saveSolution(const PlacementModel& source, PlacementModel& destination);
+    
+    /**
+     * Restores a saved solution
+     * 
+     * @param destination Solution to restore to
+     * @param source Source solution
+     */
+    void restoreSolution(PlacementModel& destination, const PlacementModel& source);
+    
+    /**
+     * Validates the current solution
+     * 
+     * @param model The placement model to validate
+     * @return True if solution is valid
+     */
+    bool validateSolution(const PlacementModel& model);
     
 public:
     /**
@@ -232,11 +209,4 @@ public:
      * @return Map of statistic name to value
      */
     std::map<std::string, int> getStatistics() const;
-
-    std::shared_ptr<BStarTreeNode>& getGlobalTree() { return globalTree; }
-    
-    std::map<std::string, std::variant<std::shared_ptr<Module>, 
-        std::shared_ptr<SymmetryIslandBlock>>>& getGlobalNodes() { 
-        return globalNodes; 
-    }
 };

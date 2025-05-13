@@ -177,8 +177,17 @@ public:
                     }
                 } else {
                     // Invalid solution, revert the perturbation
-                    restoreFn(currentSolution, tempSolution);
-                    rejectedMoves++;
+                    // At high temperatures, occasionally accept invalid solutions to explore more
+                    if (temperature > finalTemperature * 10 && acceptInvalidMove(temperature)) {
+                        // Accept the invalid solution to escape local minimum
+                        currentCost = bestCost;
+                        acceptedMoves++;
+                        std::cout << "Accepted invalid solution at temperature " << temperature << std::endl;
+                    } else {
+                        // Reject invalid solution
+                        restoreFn(currentSolution, tempSolution);
+                        rejectedMoves++;
+                    }
                 }
                 
                 totalIterations++;
@@ -337,5 +346,16 @@ private:
         auto elapsedSeconds = std::chrono::duration_cast<std::chrono::seconds>(
             currentTime - startTime).count();
         return elapsedSeconds >= timeLimit;
+    }
+
+    /**
+     * Decides whether to accept an invalid move based on current temperature
+     * @param temp Current temperature
+     * @return True if the invalid move should be accepted
+     */
+    bool acceptInvalidMove(double temp) const {
+        // At high temperatures, occasionally accept invalid solutions to explore more
+        double acceptanceProbability = temp / initialTemperature * 0.2;
+        return uniformDist(rng) < acceptanceProbability;
     }
 };

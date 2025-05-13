@@ -115,6 +115,26 @@ private:
      * @return True if solution is valid
      */
     bool validateSolution(const PlacementModel& model);
+
+    /**
+     * Validates and repairs the initial solution until it's valid or max attempts reached
+     * @return True if a valid solution was found
+     */
+    bool validateAndRepairInitialSolution();
+
+    /**
+     * Attempts to repair an invalid initial solution by resolving overlaps
+     * @return True if repair was successful
+     */
+    bool repairInitialSolution();
+
+    /**
+     * Attempts to resolve specific overlaps between modules
+     * @param module1Name First module name
+     * @param module2Name Second module name
+     * @return True if overlap was resolved
+     */
+    bool resolveModuleOverlap(const std::string& module1Name, const std::string& module2Name);
     
 public:
     /**

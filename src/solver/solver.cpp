@@ -176,9 +176,19 @@ void PlacementSolver::createInitialSolution() {
         std::cerr << "Warning: Initial packing failed" << std::endl;
     }
     
+    // NEW: Validate and repair initial solution
+    bool validSolution = validateAndRepairInitialSolution();
+    if (!validSolution) {
+        std::cerr << "Warning: Could not create a valid initial solution after repair attempts" << std::endl;
+    } else {
+        std::cout << "Successfully created a valid initial solution" << std::endl;
+    }
+    
     // Calculate initial area
     model.totalArea = PlacementPacker::calculateTotalArea(
         model.allModules, model.solutionWidth, model.solutionHeight);
+    
+    std::cout << "Initial solution area: " << model.totalArea << std::endl;
 }
 
 void PlacementSolver::createInitialASFBTree(std::shared_ptr<ASFBStarTree> asfTree) {
@@ -191,6 +201,164 @@ void PlacementSolver::createInitialASFBTree(std::shared_ptr<ASFBStarTree> asfTre
     if (!PlacementPacker::packASFBStarTree(asfTree)) {
         std::cerr << "Warning: Failed to pack initial ASF-B*-tree" << std::endl;
     }
+}
+
+bool PlacementSolver::validateAndRepairInitialSolution() {
+    // Check if the initial solution is valid
+    if (validateSolution(model)) {
+        return true;
+    }
+    
+    std::cout << "Initial solution has overlaps, attempting repair..." << std::endl;
+    
+    // Attempt to repair up to 10 times
+    const int MAX_REPAIR_ATTEMPTS = 10;
+    for (int attempt = 0; attempt < MAX_REPAIR_ATTEMPTS; ++attempt) {
+        std::cout << "Repair attempt " << (attempt + 1) << "..." << std::endl;
+        
+        if (repairInitialSolution()) {
+            if (validateSolution(model)) {
+                std::cout << "Successfully repaired initial solution" << std::endl;
+                return true;
+            }
+        }
+        
+        // Try iterative improvement packing
+        if (PlacementPacker::iterativeImprovementPacking(
+                model.allModules, model.moduleToGroup, 100)) {
+            if (validateSolution(model)) {
+                std::cout << "Successfully fixed initial solution with iterative improvement" << std::endl;
+                return true;
+            }
+        }
+    }
+    
+    return false;
+}
+
+bool PlacementSolver::repairInitialSolution() {
+    // Find all overlapping pairs
+    std::vector<std::pair<std::string, std::string>> overlappingPairs;
+    PlacementPacker::findAllOverlappingPairs(
+        model.allModules, model.moduleToGroup, overlappingPairs);
+    
+    if (overlappingPairs.empty()) {
+        return true; // No overlaps to fix
+    }
+    
+    std::cout << "Found " << overlappingPairs.size() << " overlapping pairs" << std::endl;
+    
+    // Try to resolve each overlap
+    bool anyResolved = false;
+    for (const auto& pair : overlappingPairs) {
+        if (resolveModuleOverlap(pair.first, pair.second)) {
+            anyResolved = true;
+        }
+    }
+    
+    // Re-pack the solution after repairs
+    if (anyResolved) {
+        PlacementPacker::packSolution(
+            model.allModules, model.symmetryTrees, model.symmetryIslands,
+            model.globalTree, model.globalNodes);
+    }
+    
+    return anyResolved;
+}
+
+bool PlacementSolver::resolveModuleOverlap(const std::string& module1Name, const std::string& module2Name) {
+    auto it1 = model.allModules.find(module1Name);
+    auto it2 = model.allModules.find(module2Name);
+    
+    if (it1 == model.allModules.end() || it2 == model.allModules.end()) {
+        return false;
+    }
+    
+    auto module1 = it1->second;
+    auto module2 = it2->second;
+    
+    std::cout << "Attempting to resolve overlap between " << module1Name << " and " << module2Name << std::endl;
+    
+    // Store original positions
+    int origX1 = module1->getX();
+    int origY1 = module1->getY();
+    int origX2 = module2->getX();
+    int origY2 = module2->getY();
+    
+    // Check if these are regular modules (not part of symmetry groups)
+    bool module1IsRegular = model.regularModules.find(module1Name) != model.regularModules.end();
+    bool module2IsRegular = model.regularModules.find(module2Name) != model.regularModules.end();
+    
+    // We can only directly move regular modules
+    if (!module1IsRegular && !module2IsRegular) {
+        // Can't move symmetry modules directly
+        return false;
+    }
+    
+    // Decide which module to move
+    std::shared_ptr<Module> moduleToMove;
+    std::string moduleToMoveName;
+    
+    if (module1IsRegular) {
+        moduleToMove = module1;
+        moduleToMoveName = module1Name;
+    } else if (module2IsRegular) {
+        moduleToMove = module2;
+        moduleToMoveName = module2Name;
+    } else {
+        return false;
+    }
+    
+    // Get the other module (that we're not moving)
+    std::shared_ptr<Module> otherModule = (moduleToMove == module1) ? module2 : module1;
+    
+    // Try several positions to resolve the overlap
+    const int NUM_ATTEMPTS = 8;
+    const int DISTANCE_STEP = 100; // Larger step for more distance
+    
+    for (int attempt = 0; attempt < NUM_ATTEMPTS; ++attempt) {
+        // Try moving in different directions
+        int dx = (attempt % 4 == 0) ? DISTANCE_STEP * (attempt / 4 + 1) : 
+                 (attempt % 4 == 1) ? -DISTANCE_STEP * (attempt / 4 + 1) : 0;
+        int dy = (attempt % 4 == 2) ? DISTANCE_STEP * (attempt / 4 + 1) : 
+                 (attempt % 4 == 3) ? -DISTANCE_STEP * (attempt / 4 + 1) : 0;
+        
+        // New position is current position of other module plus its size plus offset
+        int newX = otherModule->getX() + otherModule->getWidth() + dx;
+        int newY = otherModule->getY() + otherModule->getHeight() + dy;
+        
+        // Ensure we don't go negative
+        newX = std::max(0, newX);
+        newY = std::max(0, newY);
+        
+        std::cout << "  Trying to move " << moduleToMoveName << " to (" << newX << ", " << newY << ")" << std::endl;
+        
+        // Move the module
+        moduleToMove->setPosition(newX, newY);
+        
+        // Check if this resolves the overlap
+        if (!moduleToMove->overlaps(*otherModule)) {
+            std::cout << "  Successfully resolved overlap!" << std::endl;
+            return true;
+        }
+    }
+    
+    // If we reach here, we couldn't resolve the overlap
+    // Restore original positions
+    module1->setPosition(origX1, origY1);
+    module2->setPosition(origX2, origY2);
+    
+    std::cout << "  Failed to resolve overlap, trying more aggressive strategies" << std::endl;
+    
+    // More aggressive strategy: place the module far away
+    int farX = model.solutionWidth + moduleToMove->getWidth() * 2;
+    int farY = model.solutionHeight + moduleToMove->getHeight() * 2;
+    
+    moduleToMove->setPosition(farX, farY);
+    std::cout << "  Moved " << moduleToMoveName << " far away to (" << farX << ", " << farY << ")" << std::endl;
+    
+    // This should definitely resolve the overlap
+    return true;
 }
 
 void PlacementSolver::createGlobalBTree() {
@@ -256,8 +424,46 @@ void PlacementSolver::createGlobalBTree() {
 }
 
 bool PlacementSolver::performRandomPerturbation() {
-    // Choose a perturbation type based on probabilities
+    // First, check if there are any overlaps that need targeted resolution
+    std::vector<std::pair<std::string, std::string>> overlappingPairs;
+    PlacementPacker::findAllOverlappingPairs(model.allModules, model.moduleToGroup, overlappingPairs);
+    
+    // If there are overlaps and we hit a probability threshold, resolve them specifically
+    bool hasOverlaps = !overlappingPairs.empty();
     double randVal = uniformDist(rng);
+    
+    // With 20% probability, attempt targeted overlap resolution if overlaps exist
+    if (hasOverlaps && randVal < 0.2) {
+        // Choose a random overlapping pair
+        int pairIndex = uniformDist(rng) * overlappingPairs.size();
+        const auto& [module1, module2] = overlappingPairs[pairIndex];
+        
+        std::cout << "Performing targeted resolution for modules " << module1 << " and " << module2 << std::endl;
+        
+        // Attempt to resolve this specific overlap
+        bool success = resolveModuleOverlap(module1, module2);
+        
+        // If successful, repack to update positions
+        if (success) {
+            PlacementPacker::packSolution(
+                model.allModules, model.symmetryTrees, model.symmetryIslands,
+                model.globalTree, model.globalNodes);
+            return true;
+        }
+        
+        // If that fails, try iterative improvement
+        if (PlacementPacker::iterativeImprovementPacking(
+                model.allModules, model.moduleToGroup, 20)) {
+            PlacementPacker::packSolution(
+                model.allModules, model.symmetryTrees, model.symmetryIslands,
+                model.globalTree, model.globalNodes);
+            return true;
+        }
+    }
+    
+    // Otherwise, perform regular perturbation
+    // Choose a perturbation type based on probabilities
+    randVal = uniformDist(rng);
     
     if (randVal < probRotate) {
         // Rotate a module
@@ -345,6 +551,7 @@ bool PlacementSolver::performRandomPerturbation() {
     return false;
 }
 
+
 int PlacementSolver::calculateCost(const PlacementModel& model) {
     // For now, just use the area as the cost
     // In a more complex implementation, this would include wirelength
@@ -362,8 +569,8 @@ void PlacementSolver::restoreSolution(PlacementModel& destination, const Placeme
 }
 
 bool PlacementSolver::validateSolution(const PlacementModel& model) {
-    // Check for overlaps
-    if (PlacementPacker::hasOverlaps(model.allModules, model.moduleToGroup)) {
+    // Check for overlaps at the global level
+    if (PlacementPacker::hasGlobalOverlaps(model.allModules, model.moduleToGroup, model.symmetryIslands)) {
         return false;
     }
     

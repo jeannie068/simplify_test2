@@ -73,6 +73,51 @@ public:
         std::map<std::string, std::shared_ptr<Module>>& regularModules,
         std::shared_ptr<Contour> horizontalContour,
         std::shared_ptr<Contour> verticalContour);
+
+    /**
+     * Packs a B*-tree node and its children using DFS traversal with both horizontal and vertical contours
+     * 
+     * @param node The node to pack
+     * @param globalNodes Map of node names to module or island pointers
+     * @param horizontalContour Horizontal contour
+     * @param verticalContour Vertical contour 
+     * @param parentX X-coordinate of the parent node
+     * @param parentY Y-coordinate of the parent node
+     * @return True if packing succeeded
+     */
+    static bool packTreeNodeDFS(
+        std::shared_ptr<BStarTreeNode> node,
+        std::map<std::string, std::variant<std::shared_ptr<Module>, 
+                                         std::shared_ptr<SymmetryIslandBlock>>>& globalNodes,
+        std::shared_ptr<Contour> horizontalContour,
+        std::shared_ptr<Contour> verticalContour,
+        int parentX,
+        int parentY);
+
+    /**
+     * Finds all overlapping module pairs in the placement
+     * 
+     * @param allModules All modules in the design
+     * @param moduleToGroup Mapping from module name to its symmetry group
+     * @param overlappingPairs Output vector of overlapping module pairs
+     */
+    static void findAllOverlappingPairs(
+        const std::map<std::string, std::shared_ptr<Module>>& allModules,
+        const std::map<std::string, std::shared_ptr<SymmetryGroup>>& moduleToGroup,
+        std::vector<std::pair<std::string, std::string>>& overlappingPairs);
+
+    /**
+     * Performs iterative improvement to resolve overlaps in the placement
+     * 
+     * @param allModules All modules in the design
+     * @param moduleToGroup Mapping from module name to its symmetry group
+     * @param maxIterations Maximum number of iterations
+     * @return True if all overlaps were resolved
+     */
+    static bool iterativeImprovementPacking(
+        std::map<std::string, std::shared_ptr<Module>>& allModules,
+        const std::map<std::string, std::shared_ptr<SymmetryGroup>>& moduleToGroup,
+        int maxIterations);
     
     /**
      * Checks if there are any overlaps between modules
@@ -84,6 +129,19 @@ public:
     static bool hasOverlaps(
         const std::map<std::string, std::shared_ptr<Module>>& allModules,
         const std::map<std::string, std::shared_ptr<SymmetryGroup>>& moduleToGroup);
+
+    /**
+     * Checks if there are any overlaps between global entities (regular modules and symmetry islands)
+     * 
+     * @param allModules All modules in the design
+     * @param moduleToGroup Mapping from module name to its symmetry group
+     * @param symmetryIslands Vector of symmetry islands
+     * @return True if there are overlaps at the global level
+     */
+    static bool hasGlobalOverlaps(
+        const std::map<std::string, std::shared_ptr<Module>>& allModules,
+        const std::map<std::string, std::shared_ptr<SymmetryGroup>>& moduleToGroup,
+        const std::vector<std::shared_ptr<SymmetryIslandBlock>>& symmetryIslands);
     
     /**
      * Validates symmetry constraints

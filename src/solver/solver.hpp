@@ -61,25 +61,6 @@ private:
     int timeLimit;
     
     /**
-     * Creates an initial placement solution
-     */
-    void createInitialSolution();
-    
-    /**
-     * Packs all modules (regular and symmetry groups)
-     * using grid-based packing strategy
-     * @return True if packing succeeded
-     */
-    bool packSolution();
-    
-    /**
-     * Packs regular modules using B*-tree
-     * @param boundingRects Map of available spaces and their dimensions
-     * @return True if packing succeeded
-     */
-    bool packRegularModules(const std::vector<std::pair<int, int>>& availablePositions);
-    
-    /**
      * Calculates total placement area
      * @return Total area
      */
@@ -175,6 +156,85 @@ public:
      * @return True if a valid solution was found, false otherwise
      */
     bool solve();
+
+    /**
+     * Process a single symmetry group with internal SA
+     * 
+     * @param asfTree The symmetry group's ASF-B*-tree
+     * @param startTime The overall start time for time limit tracking
+     * @return True if processing was successful
+     */
+    bool processSymmetryGroupInternally( std::shared_ptr<ASFBStarTree> asfTree,
+                                        const std::chrono::steady_clock::time_point& startTime);
+
+    /**
+     * Finalizes a symmetry group's contour after internal optimization
+     */
+    void finalizeSymmetryGroupContour(std::shared_ptr<ASFBStarTree> asfTree); 
+
+    /**
+     * Perturbs the combined placement (symmetry groups and regular modules)
+     */
+    bool perturbCombinedPlacement( std::mt19937& rng, 
+                                    std::uniform_real_distribution<double>& uniformDist);
+        
+    /**
+     * Creates initial solution for just regular modules
+     */
+    void createInitialRegularSolution();
+
+    /**
+     * Packs the combined solution (symmetry groups + regular modules)
+     */
+    bool packCombinedSolution(); 
+
+    /**
+     * Validates a single symmetry group
+     */
+    bool validateSymmetryGroup(std::shared_ptr<ASFBStarTree> asfTree); 
+
+    /**
+     * Checks for overlaps within a symmetry group
+     */
+    bool hasOverlapsInSymmetryGroup(std::shared_ptr<ASFBStarTree> asfTree);    
+
+    /**
+     * Performs rotation perturbation within a symmetry group
+     */
+    bool perturbRotateInSymmetryGroup(
+        std::shared_ptr<ASFBStarTree> asfTree,
+        std::mt19937& rng,
+        std::uniform_real_distribution<double>& uniformDist);
+
+    /**
+     * Performs pre-order perturbation within a symmetry group
+     */
+    bool perturbPreOrderInSymmetryGroup(
+        std::shared_ptr<ASFBStarTree> asfTree,
+        std::mt19937& rng,
+        std::uniform_real_distribution<double>& uniformDist);     
+
+    /**
+     * Performs in-order perturbation within a symmetry group
+     */
+    bool perturbInOrderInSymmetryGroup(
+        std::shared_ptr<ASFBStarTree> asfTree,
+        std::mt19937& rng,
+        std::uniform_real_distribution<double>& uniformDist); 
+
+    /**
+     * Helper function to collect nodes in pre-order traversal
+     */
+    void collectNodesPreOrder(
+        const std::shared_ptr<BStarTreeNode>& root,
+        std::vector<std::shared_ptr<BStarTreeNode>>& nodes); 
+        
+    /**
+     * Helper function to collect nodes in in-order traversal
+     */
+    void collectNodesInOrder(
+        const std::shared_ptr<BStarTreeNode>& root,
+        std::vector<std::shared_ptr<BStarTreeNode>>& nodes);
     
     /**
      * Gets the solution area

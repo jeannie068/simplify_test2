@@ -226,107 +226,151 @@ void PlacementSolver::inorder(BStarNode* node) {
     inorder(node->right);
 }
 
-// Pack B*-tree to get coordinates
+/**
+ * Packs the B*-tree to get the coordinates of all modules and islands
+ */
 void PlacementSolver::packBStarTree() {
     // Clear the contour
     clearContour();
     
-    // Update the traversals for the current B*-tree
+    // Create a parent-child relationship map for efficient lookup
+    std::unordered_map<BStarNode*, BStarNode*> parentMap;
+    std::function<void(BStarNode*, BStarNode*)> buildParentMap = [&](BStarNode* node, BStarNode* parent) {
+        if (node == nullptr) return;
+        parentMap[node] = parent;
+        buildParentMap(node->left, node);
+        buildParentMap(node->right, node);
+    };
+    buildParentMap(bstarRoot, nullptr);
+    
+    // Initialize node positions
+    std::unordered_map<BStarNode*, std::pair<int, int>> nodePositions;
+    
+    // Use level-order traversal (BFS) to ensure parents are processed before children
+    std::queue<BStarNode*> bfsQueue;
+    if (bstarRoot != nullptr) {
+        bfsQueue.push(bstarRoot);
+        // Root is placed at (0,0)
+        nodePositions[bstarRoot] = {0, 0};
+        
+        // Update the module/island position
+        if (bstarRoot->isSymmetryIsland) {
+            // Extract island index from name (format: "island_X")
+            size_t islandIndex = std::stoi(bstarRoot->name.substr(7));
+            if (islandIndex < symmetryIslands.size()) {
+                symmetryIslands[islandIndex]->setPosition(0, 0);
+                updateContour(0, 0, 
+                             symmetryIslands[islandIndex]->getWidth(), 
+                             symmetryIslands[islandIndex]->getHeight());
+            }
+        } else {
+            // Regular module
+            if (regularModules.find(bstarRoot->name) != regularModules.end()) {
+                regularModules[bstarRoot->name]->setPosition(0, 0);
+                updateContour(0, 0, 
+                             regularModules[bstarRoot->name]->getWidth(), 
+                             regularModules[bstarRoot->name]->getHeight());
+            }
+        }
+    }
+    
+    while (!bfsQueue.empty()) {
+        BStarNode* node = bfsQueue.front();
+        bfsQueue.pop();
+        
+        // Get current node position
+        int nodeX = nodePositions[node].first;
+        int nodeY = nodePositions[node].second;
+        
+        // Get current node dimensions
+        int width = 0;
+        int height = 0;
+        
+        if (node->isSymmetryIsland) {
+            // Extract island index
+            size_t islandIndex = std::stoi(node->name.substr(7));
+            if (islandIndex < symmetryIslands.size()) {
+                width = symmetryIslands[islandIndex]->getWidth();
+                height = symmetryIslands[islandIndex]->getHeight();
+            }
+        } else {
+            // Regular module
+            if (regularModules.find(node->name) != regularModules.end()) {
+                width = regularModules[node->name]->getWidth();
+                height = regularModules[node->name]->getHeight();
+            }
+        }
+        
+        // Process left child (placed to the right of current node)
+        if (node->left) {
+            int leftX = nodeX + width;
+            int leftY = getContourHeight(leftX);
+            
+            // Store position of left child
+            nodePositions[node->left] = {leftX, leftY};
+            
+            // Update module/island position
+            if (node->left->isSymmetryIsland) {
+                // Symmetry island
+                size_t islandIndex = std::stoi(node->left->name.substr(7));
+                if (islandIndex < symmetryIslands.size()) {
+                    symmetryIslands[islandIndex]->setPosition(leftX, leftY);
+                    updateContour(leftX, leftY, 
+                                 symmetryIslands[islandIndex]->getWidth(), 
+                                 symmetryIslands[islandIndex]->getHeight());
+                }
+            } else {
+                // Regular module
+                if (regularModules.find(node->left->name) != regularModules.end()) {
+                    regularModules[node->left->name]->setPosition(leftX, leftY);
+                    updateContour(leftX, leftY, 
+                                 regularModules[node->left->name]->getWidth(), 
+                                 regularModules[node->left->name]->getHeight());
+                }
+            }
+            
+            // Add to queue for further processing
+            bfsQueue.push(node->left);
+        }
+        
+        // Process right child (placed at same x, above current node)
+        if (node->right) {
+            int rightX = nodeX;
+            int rightY = nodeY + height;
+            
+            // Store position of right child
+            nodePositions[node->right] = {rightX, rightY};
+            
+            // Update module/island position
+            if (node->right->isSymmetryIsland) {
+                // Symmetry island
+                size_t islandIndex = std::stoi(node->right->name.substr(7));
+                if (islandIndex < symmetryIslands.size()) {
+                    symmetryIslands[islandIndex]->setPosition(rightX, rightY);
+                    updateContour(rightX, rightY, 
+                                 symmetryIslands[islandIndex]->getWidth(), 
+                                 symmetryIslands[islandIndex]->getHeight());
+                }
+            } else {
+                // Regular module
+                if (regularModules.find(node->right->name) != regularModules.end()) {
+                    regularModules[node->right->name]->setPosition(rightX, rightY);
+                    updateContour(rightX, rightY, 
+                                 regularModules[node->right->name]->getWidth(), 
+                                 regularModules[node->right->name]->getHeight());
+                }
+            }
+            
+            // Add to queue for further processing
+            bfsQueue.push(node->right);
+        }
+    }
+    
+    // Update preorder and inorder traversals after packing
     preorderTraversal.clear();
     inorderTraversal.clear();
     preorder(bstarRoot);
     inorder(bstarRoot);
-    
-    // Traverse the tree in preorder
-    std::vector<BStarNode*> nodeStack;
-    if (bstarRoot != nullptr) {
-        nodeStack.push_back(bstarRoot);
-    }
-    
-    while (!nodeStack.empty()) {
-        BStarNode* node = nodeStack.back();
-        nodeStack.pop_back();
-        
-        int width, height;
-        if (node->isSymmetryIsland) {
-            // Extract island index from name (format: "island_X")
-            size_t islandIndex = std::stoi(node->name.substr(7));
-            if (islandIndex >= symmetryIslands.size()) {
-                continue; // Invalid island index
-            }
-            
-            // Get dimensions from the symmetry island
-            width = symmetryIslands[islandIndex]->getWidth();
-            height = symmetryIslands[islandIndex]->getHeight();
-        } else {
-            // Regular module
-            if (regularModules.find(node->name) == regularModules.end()) {
-                continue; // Module not found
-            }
-            
-            std::shared_ptr<Module> module = regularModules[node->name];
-            width = module->getWidth();
-            height = module->getHeight();
-        }
-        
-        // Determine x-coordinate from the parent-child relationship
-        int x = 0;
-        if (node != bstarRoot) {
-            bool found = false;
-            for (BStarNode* parent : nodeStack) {
-                if (parent->left == node) {
-                    // Left child: placed to the right of parent
-                    if (parent->isSymmetryIsland) {
-                        size_t parentIslandIndex = std::stoi(parent->name.substr(7));
-                        x = symmetryIslands[parentIslandIndex]->getX() + symmetryIslands[parentIslandIndex]->getWidth();
-                    } else {
-                        std::shared_ptr<Module> parentModule = regularModules[parent->name];
-                        x = parentModule->getX() + parentModule->getWidth();
-                    }
-                    found = true;
-                    break;
-                } else if (parent->right == node) {
-                    // Right child: same x-coordinate as parent
-                    if (parent->isSymmetryIsland) {
-                        size_t parentIslandIndex = std::stoi(parent->name.substr(7));
-                        x = symmetryIslands[parentIslandIndex]->getX();
-                    } else {
-                        std::shared_ptr<Module> parentModule = regularModules[parent->name];
-                        x = parentModule->getX();
-                    }
-                    found = true;
-                    break;
-                }
-            }
-            
-            if (!found) {
-                // This should not happen in a valid B*-tree
-                continue;
-            }
-        }
-        
-        // Determine y-coordinate from the contour
-        int y = getContourHeight(x);
-        
-        // Update the position
-        if (node->isSymmetryIsland) {
-            size_t islandIndex = std::stoi(node->name.substr(7));
-            symmetryIslands[islandIndex]->setPosition(x, y);
-        } else {
-            regularModules[node->name]->setPosition(x, y);
-        }
-        
-        // Update the contour
-        updateContour(x, y, width, height);
-        
-        // Add children to the stack (right child first for proper DFS order)
-        if (node->right != nullptr) {
-            nodeStack.push_back(node->right);
-        }
-        if (node->left != nullptr) {
-            nodeStack.push_back(node->left);
-        }
-    }
 }
 
 // Calculate bounding box area

@@ -1,33 +1,75 @@
-/**
- * solver.hpp
- * 
- * This file defines the PlacementSolver class which orchestrates the overall
- * placement algorithm using the new modular architecture.
- */
-
 #pragma once
 
-#include <memory>
-#include <vector>
 #include <map>
+#include <vector>
+#include <memory>
 #include <string>
 #include <random>
-#include <variant>
 #include <chrono>
+#include <functional>
+#include <iostream>
 
 #include "../data_struct/Module.hpp"
 #include "../data_struct/SymmetryConstraint.hpp"
-#include "../data_struct/BStarTreeNode.hpp"
-#include "../data_struct/RestructuredBStarTree.hpp"
 #include "../data_struct/ASFBStarTree.hpp"
 #include "../data_struct/SymmetryIslandBlock.hpp"
-#include "../utils/PlacementModel.hpp"
-#include "../utils/SA.hpp"
+#include "../data_struct/BStarTree.hpp"
 
+/**
+ * @brief Placement solver using simulated annealing
+ * 
+ * This class implements a simulated annealing algorithm for analog placement
+ * with symmetry constraints. It handles both global placement optimization
+ * and local symmetry island optimization.
+ */
 class PlacementSolver {
 private:
-    // Placement model containing all solution data
-    PlacementModel model;
+    // Problem data
+    std::map<std::string, std::shared_ptr<Module>> modules;
+    std::vector<std::shared_ptr<SymmetryGroup>> symmetryGroups;
+    
+    // Symmetry islands (one for each symmetry group)
+    std::vector<std::shared_ptr<SymmetryIslandBlock>> symmetryIslands;
+    
+    // Regular modules (not in symmetry groups)
+    std::map<std::string, std::shared_ptr<Module>> regularModules;
+    
+    // B*-tree for global placement
+    struct BStarNode {
+        std::string name;
+        bool isSymmetryIsland;
+        BStarNode* left;
+        BStarNode* right;
+        
+        BStarNode(const std::string& name, bool isSymmetryIsland)
+            : name(name), isSymmetryIsland(isSymmetryIsland), left(nullptr), right(nullptr) {}
+    };
+    
+    BStarNode* bstarRoot;
+
+    // Backup storage for B*-tree structure
+    struct TreeNodeInfo {
+        std::string name;
+        bool isIsland;
+    };
+    
+    struct BStarTreeBackup {
+        std::vector<TreeNodeInfo> preorderNodes;
+        std::vector<TreeNodeInfo> inorderNodes;
+    };
+    
+    BStarTreeBackup bstarTreeBackup;
+    BStarTreeBackup bestBStarTreeBackup;
+    
+    // Current solution
+    std::map<std::string, std::shared_ptr<Module>> solutionModules;
+    int solutionArea;
+    double solutionWirelength;
+    
+    // Best solution found so far
+    std::map<std::string, std::shared_ptr<Module>> bestSolutionModules;
+    int bestSolutionArea;
+    double bestSolutionWirelength;
     
     // Simulated annealing parameters
     double initialTemperature;
@@ -37,119 +79,194 @@ private:
     int noImprovementLimit;
     
     // Perturbation probabilities
-    double probRotate;
-    double probMove;
-    double probSwap;
-    double probChangeRep;
-    double probConvertSym;
+    double rotateProb;
+    double moveProb;
+    double swapProb;
+    double changeRepProb;
+    double convertSymProb;
     
     // Cost function weights
     double areaWeight;
     double wirelengthWeight;
     
-    // Random seed and generator
-    unsigned int randomSeed;
+    // Random number generation
     std::mt19937 rng;
-    std::uniform_real_distribution<double> uniformDist;
     
     // Time limit in seconds
     int timeLimit;
+    std::chrono::steady_clock::time_point startTime;
+    
+    // Contour data structure for packing
+    struct ContourPoint {
+        int x;
+        int height;
+        ContourPoint* next;
+        
+        ContourPoint(int x, int height) : x(x), height(height), next(nullptr) {}
+    };
+    
+    ContourPoint* contourHead;
+    
+    // Preorder and inorder traversals for B*-tree
+    std::vector<BStarNode*> preorderTraversal;
+    std::vector<BStarNode*> inorderTraversal;
     
     /**
-     * Creates an initial placement solution
-     */
-    void createInitialSolution();
-    
-    /**
-     * Creates an initial ASF-B*-tree for a symmetry group
+     * Cleans up the B*-tree
      * 
-     * @param asfTree The ASF-B*-tree to initialize
+     * @param node Root node to start cleanup
      */
-    void createInitialASFBTree(std::shared_ptr<ASFBStarTree> asfTree);
+    void cleanupBStarTree(BStarNode* node);
     
     /**
-     * Creates a global B*-tree for overall placement
+     * Clears the contour data structure
      */
-    void createGlobalBTree();
-
-    std::shared_ptr<BStarTreeNode> convertRestructuredTreeToGlobalTree(const RestructuredBStarTree &restructuredTree);
-
-    void optimizeGlobalTreeStructure();
-
-    void collectGlobalNodesPreOrder(const std::shared_ptr<BStarTreeNode> &node, std::vector<std::shared_ptr<BStarTreeNode>> &nodes);
-
-    void rebuildGlobalTree();
-
-    void updateTreeStructureAfterMovement(const std::string &moduleName);
-
-    bool validateAndUpdateTreeStructure(const std::string &fromNodeName, const std::string &toNodeName, bool asLeftChild);
-
-    /**
-     * Initializes module grouping
-     * Identifies which modules belong to which symmetry groups
-     */
-    void initializeModuleGrouping();
-
-    std::shared_ptr<BStarTreeNode> findNodeInGlobalTree(const std::shared_ptr<BStarTreeNode> &root, const std::string &nodeName);
-
-    /**
-     * Performs a random perturbation on the current solution
-     *
-     * @return True if perturbation succeeded
-     */
-    bool performRandomPerturbation();
+    void clearContour();
     
     /**
-     * Cost function for the placement
+     * Updates the contour after placing a module
      * 
-     * @param model The placement model
-     * @return Total cost (mainly area)
+     * @param x X-coordinate of the module
+     * @param y Y-coordinate of the module
+     * @param width Width of the module
+     * @param height Height of the module
      */
-    int calculateCost(const PlacementModel& model);
+    void updateContour(int x, int y, int width, int height);
     
     /**
-     * Saves the current solution
+     * Gets the height of the contour at a given x-coordinate
      * 
-     * @param source Source solution
-     * @param destination Destination to save to
+     * @param x X-coordinate
+     * @return The height of the contour at x
      */
-    void saveSolution(const PlacementModel& source, PlacementModel& destination);
+    int getContourHeight(int x);
     
     /**
-     * Restores a saved solution
-     * 
-     * @param destination Solution to restore to
-     * @param source Source solution
+     * Builds an initial B*-tree for global placement
      */
-    void restoreSolution(PlacementModel& destination, const PlacementModel& source);
+    void buildInitialBStarTree();
     
     /**
-     * Validates the current solution
+     * Performs a preorder traversal of the B*-tree
      * 
-     * @param model The placement model to validate
-     * @return True if solution is valid
+     * @param node The current node
      */
-    bool validateSolution(const PlacementModel& model);
+    void preorder(BStarNode* node);
+    
+    /**
+     * Performs an inorder traversal of the B*-tree
+     * 
+     * @param node The current node
+     */
+    void inorder(BStarNode* node);
+    
+    /**
+     * Packs the B*-tree to get the coordinates of all modules and islands
+     */
+    void packBStarTree();
+    
+    /**
+     * Calculates the bounding box area of the current placement
+     * 
+     * @return Area of the bounding box
+     */
+    int calculateArea();
+    
+    /**
+     * Calculates the half-perimeter wirelength (placeholder)
+     * 
+     * @return Half-perimeter wirelength
+     */
+    double calculateWirelength();
+    
+    /**
+     * Calculates the cost of the current solution
+     * 
+     * @return Cost value
+     */
+    double calculateCost();
+    
+    /**
+     * Performs a random perturbation on the solution
+     * 
+     * @return True if perturbation was successful
+     */
+    bool perturb();
+    
+    /**
+     * Rotates a module
+     * 
+     * @param isSymmetryIsland True if perturbing a symmetry island, false for regular module
+     * @param name Name of the module or symmetry island
+     * @return True if perturbation was successful
+     */
+    bool rotateModule(bool isSymmetryIsland, const std::string& name);
+    
+    /**
+     * Moves a node in the B*-tree
+     * 
+     * @param node The node to move
+     * @return True if perturbation was successful
+     */
+    bool moveNode(BStarNode* node);
+    
+    /**
+     * Swaps two nodes in the B*-tree
+     * 
+     * @return True if perturbation was successful
+     */
+    bool swapNodes();
+    
+    /**
+     * Changes representative for a symmetry pair
+     * 
+     * @return True if perturbation was successful
+     */
+    bool changeRepresentative();
+    
+    /**
+     * Converts symmetry type for a symmetry group
+     * 
+     * @return True if perturbation was successful
+     */
+    bool convertSymmetryType();
+
+    bool validateBStarTree();
 
     /**
-     * Validates and repairs the initial solution until it's valid or max attempts reached
-     * @return True if a valid solution was found
+     * Checks if any modules overlap in the current placement
+     * 
+     * @return True if there are overlaps
      */
-    bool validateAndRepairInitialSolution();
-
+    bool hasOverlaps();
+    
     /**
-     * Attempts to repair an invalid initial solution by resolving overlaps
-     * @return True if repair was successful
+     * Performs deep copy of module data
+     * 
+     * @param source Source map of modules
+     * @return New map with copied modules
      */
-    bool repairInitialSolution();
+    std::map<std::string, std::shared_ptr<Module>> copyModules(const std::map<std::string, std::shared_ptr<Module>> &source);
 
+    void backupBStarTree();
+
+    void restoreBStarTree();
     /**
-     * Attempts to resolve specific overlaps between modules
-     * @param module1Name First module name
-     * @param module2Name Second module name
-     * @return True if overlap was resolved
+     * Finds a random node in the B*-tree
+     * 
+     * @return Pointer to a random node
      */
-    bool resolveModuleOverlap(const std::string& module1Name, const std::string& module2Name);
+    BStarNode* findRandomNode();
+    
+    /**
+     * Copies the current solution to the best solution
+     */
+    void updateBestSolution();
+    
+    /**
+     * Copies the best solution to the current solution
+     */
+    void restoreBestSolution();
     
 public:
     /**
@@ -163,34 +280,35 @@ public:
     ~PlacementSolver();
     
     /**
-     * Loads modules and symmetry constraints
+     * Loads the problem data
      * 
-     * @param modules Map of module names to modules
+     * @param modules Map of all modules
      * @param symmetryGroups Vector of symmetry groups
+     * @return True if loading was successful
      */
-    void loadProblem(const std::map<std::string, std::shared_ptr<Module>>& modules,
-                    const std::vector<std::shared_ptr<SymmetryGroup>>& symmetryGroups);
+    bool loadProblem(const std::map<std::string, std::shared_ptr<Module>>& modules, 
+                     const std::vector<std::shared_ptr<SymmetryGroup>>& symmetryGroups);
     
     /**
      * Sets simulated annealing parameters
      * 
      * @param initialTemp Initial temperature
      * @param finalTemp Final temperature
-     * @param coolRate Cooling rate
-     * @param iterations Number of iterations per temperature
-     * @param noImprovementLimit Maximum number of iterations without improvement
+     * @param cooling Cooling rate (0-1)
+     * @param iterations Iterations per temperature
+     * @param noImprovementLimit Number of consecutive non-improving iterations before early termination
      */
-    void setAnnealingParameters(double initialTemp, double finalTemp, double coolRate, 
-                               int iterations, int noImprovementLimit);
+    void setAnnealingParameters(double initialTemp, double finalTemp, double cooling, 
+                                int iterations, int noImprovementLimit);
     
     /**
      * Sets perturbation probabilities
      * 
-     * @param rotate Probability of rotation operation
-     * @param move Probability of move operation
-     * @param swap Probability of swap operation
-     * @param changeRep Probability of change representative operation
-     * @param convertSym Probability of convert symmetry type operation
+     * @param rotate Probability of rotation
+     * @param move Probability of move
+     * @param swap Probability of swap
+     * @param changeRep Probability of changing representative
+     * @param convertSym Probability of converting symmetry type
      */
     void setPerturbationProbabilities(double rotate, double move, double swap, 
                                      double changeRep, double convertSym);
@@ -198,50 +316,43 @@ public:
     /**
      * Sets cost function weights
      * 
-     * @param area Weight for area term
-     * @param wirelength Weight for wirelength term
+     * @param areaWeight Weight for area cost
+     * @param wirelengthWeight Weight for wirelength cost
      */
-    void setCostWeights(double area, double wirelength);
+    void setCostWeights(double areaWeight, double wirelengthWeight);
     
     /**
-     * Sets random seed for reproducibility
+     * Sets the random seed
      * 
      * @param seed Random seed
      */
     void setRandomSeed(unsigned int seed);
     
     /**
-     * Sets time limit for SA in seconds
+     * Sets the time limit in seconds
      * 
      * @param seconds Time limit in seconds
      */
     void setTimeLimit(int seconds);
     
     /**
-     * Solves the placement problem using simulated annealing
+     * Solves the placement problem
      * 
-     * @return True if a valid solution was found, false otherwise
+     * @return True if solution was found
      */
     bool solve();
     
     /**
      * Gets the solution area
      * 
-     * @return Total area of the placement
+     * @return Area of the solution
      */
     int getSolutionArea() const;
     
     /**
-     * Gets the solution modules with their positions
+     * Gets the solution modules
      * 
-     * @return Map of module names to modules
+     * @return Map of modules with their final positions
      */
-    std::map<std::string, std::shared_ptr<Module>> getSolutionModules() const;
-    
-    /**
-     * Gets placement solution statistics
-     * 
-     * @return Map of statistic name to value
-     */
-    std::map<std::string, int> getStatistics() const;
+    const std::map<std::string, std::shared_ptr<Module>>& getSolutionModules() const;
 };

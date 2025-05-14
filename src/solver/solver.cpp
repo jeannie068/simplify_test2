@@ -1,1003 +1,1171 @@
-/**
- * solver.cpp
- * 
- * Implementation of the PlacementSolver class which orchestrates the overall
- * placement algorithm using the new modular architecture.
- */
-
 #include "solver.hpp"
-#include "../utils/PlacementPacker.hpp"
-#include "../utils/PlacementPerturber.hpp"
-#include "../data_struct/RestructuredBStarTree.hpp"
-#include <iostream>
-#include <ctime>
 #include <algorithm>
+#include <cmath>
 #include <limits>
 #include <queue>
-#include <random>
 
+// Constructor
 PlacementSolver::PlacementSolver()
-    : initialTemperature(1000.0),
-      finalTemperature(0.1),
-      coolingRate(0.98),
-      iterationsPerTemperature(300),
-      noImprovementLimit(3000),
-      probRotate(0.4),
-      probMove(0.3),
-      probSwap(0.2),
-      probChangeRep(0.05),
-      probConvertSym(0.05),
-      areaWeight(1.0),
-      wirelengthWeight(0.0),
-      randomSeed(static_cast<unsigned int>(std::time(nullptr))),
-      uniformDist(0.0, 1.0),
-      timeLimit(290) {
+    : bstarRoot(nullptr), contourHead(nullptr),
+      solutionArea(0), solutionWirelength(0),
+      bestSolutionArea(std::numeric_limits<int>::max()), bestSolutionWirelength(0),
+      initialTemperature(1000.0), finalTemperature(0.1),
+      coolingRate(0.95), iterationsPerTemperature(100), noImprovementLimit(1000),
+      rotateProb(0.3), moveProb(0.3), swapProb(0.3),
+      changeRepProb(0.05), convertSymProb(0.05),
+      areaWeight(1.0), wirelengthWeight(0.0),
+      timeLimit(300) {
     
     // Initialize random number generator
-    rng.seed(randomSeed);
+    std::random_device rd;
+    rng = std::mt19937(rd());
 }
 
+// Destructor
 PlacementSolver::~PlacementSolver() {
-    // Smart pointers handle cleanup
+    cleanupBStarTree(bstarRoot);
+    clearContour();
 }
 
-void PlacementSolver::loadProblem(const std::map<std::string, std::shared_ptr<Module>>& modules,
-                                const std::vector<std::shared_ptr<SymmetryGroup>>& symmetryGroups) {
-    // Initialize the placement model
-    model = PlacementModel(modules, symmetryGroups);
+// Cleanup B*-tree
+void PlacementSolver::cleanupBStarTree(BStarNode* node) {
+    if (node == nullptr) return;
     
-    // Initialize module grouping
-    initializeModuleGrouping();
+    cleanupBStarTree(node->left);
+    cleanupBStarTree(node->right);
+    delete node;
 }
 
-void PlacementSolver::initializeModuleGrouping() {
-    // Clear existing groupings
-    model.regularModules.clear();
-    model.symmetryTrees.clear();
-    model.moduleToGroup.clear();
-    
-    // Track which modules are part of symmetry groups
-    std::unordered_set<std::string> symmetryModules;
-    
-    // Process symmetry groups
-    for (const auto& group : model.symmetryGroups) {
-        // Create a new ASF-B*-tree for this symmetry group
-        auto asfTree = std::make_shared<ASFBStarTree>(group);
-        model.symmetryTrees[group->getName()] = asfTree;
-        
-        // Process symmetry pairs
-        for (const auto& pair : group->getSymmetryPairs()) {
-            // Add modules to the symmetry group
-            if (model.allModules.find(pair.first) != model.allModules.end()) {
-                asfTree->addModule(model.allModules[pair.first]);
-                symmetryModules.insert(pair.first);
-                model.moduleToGroup[pair.first] = group;
-            }
-            
-            if (model.allModules.find(pair.second) != model.allModules.end()) {
-                asfTree->addModule(model.allModules[pair.second]);
-                symmetryModules.insert(pair.second);
-                model.moduleToGroup[pair.second] = group;
-            }
-        }
-        
-        // Process self-symmetric modules
-        for (const auto& moduleName : group->getSelfSymmetric()) {
-            if (model.allModules.find(moduleName) != model.allModules.end()) {
-                asfTree->addModule(model.allModules[moduleName]);
-                symmetryModules.insert(moduleName);
-                model.moduleToGroup[moduleName] = group;
-            }
-        }
+// Clear contour data structure
+void PlacementSolver::clearContour() {
+    while (contourHead != nullptr) {
+        ContourPoint* temp = contourHead;
+        contourHead = contourHead->next;
+        delete temp;
     }
-    
-    // Identify regular modules (not part of symmetry groups)
-    for (const auto& pair : model.allModules) {
-        if (symmetryModules.find(pair.first) == symmetryModules.end()) {
-            model.regularModules[pair.first] = pair.second;
-        }
-    }
-    
-    std::cout << "Initialized: " << model.regularModules.size() << " regular modules, "
-              << model.symmetryGroups.size() << " symmetry groups" << std::endl;
+    contourHead = nullptr;
 }
 
-void PlacementSolver::createInitialSolution() {
-    // Initialize ASF-B*-trees for symmetry groups
-    for (auto& pair : model.symmetryTrees) {
-        createInitialASFBTree(pair.second);
+// Update contour after placing a module
+void PlacementSolver::updateContour(int x, int y, int width, int height) {
+    int right = x + width;
+    int top = y + height;
+    
+    // Create a new contour point if contour is empty
+    if (contourHead == nullptr) {
+        contourHead = new ContourPoint(x, top);
+        contourHead->next = new ContourPoint(right, 0);
+        return;
     }
     
-    // Create B*-tree for regular modules (if any)
-    model.regularTree = nullptr;
-    if (!model.regularModules.empty()) {
-        // Create a basic B*-tree structure
-        // Sort regular modules by area (largest first)
-        std::vector<std::pair<std::string, std::shared_ptr<Module>>> sortedModules;
-        for (const auto& pair : model.regularModules) {
-            sortedModules.push_back(pair);
-        }
+    // Find the position to insert or update
+    ContourPoint* curr = contourHead;
+    ContourPoint* prev = nullptr;
+    
+    // Skip points to the left of the module
+    while (curr != nullptr && curr->x < x) {
+        prev = curr;
+        curr = curr->next;
+    }
+    
+    // Update or insert points for the module
+    if (curr == nullptr || curr->x > right) {
+        // Module is beyond the current contour
+        ContourPoint* newPoint = new ContourPoint(x, top);
+        newPoint->next = new ContourPoint(right, prev ? prev->height : 0);
+        newPoint->next->next = curr;
         
-        std::sort(sortedModules.begin(), sortedModules.end(), 
-                 [](const auto& a, const auto& b) {
-                     return a.second->getArea() > b.second->getArea();
-                 });
-        
-        // Create the tree
-        if (!sortedModules.empty()) {
-            model.regularTree = std::make_shared<BStarTreeNode>(sortedModules[0].first);
-            
-            // Add other nodes in a more balanced tree structure
-            for (size_t i = 1; i < sortedModules.size(); ++i) {
-                auto newNode = std::make_shared<BStarTreeNode>(sortedModules[i].first);
-                
-                // Find a suitable parent node using BFS
-                std::queue<std::shared_ptr<BStarTreeNode>> queue;
-                queue.push(model.regularTree);
-                
-                bool placed = false;
-                while (!queue.empty() && !placed) {
-                    auto current = queue.front();
-                    queue.pop();
-                    
-                    if (!current->getLeftChild()) {
-                        current->setLeftChild(newNode);
-                        newNode->setParent(current);
-                        placed = true;
-                    } else if (!current->getRightChild()) {
-                        current->setRightChild(newNode);
-                        newNode->setParent(current);
-                        placed = true;
-                    } else {
-                        queue.push(current->getLeftChild());
-                        queue.push(current->getRightChild());
-                    }
-                }
-            }
+        if (prev) {
+            prev->next = newPoint;
+        } else {
+            contourHead = newPoint;
         }
-    }
-    
-    // Create symmetry islands from ASF-B*-trees
-    model.symmetryIslands.clear();
-    for (const auto& pair : model.symmetryTrees) {
-        auto islandBlock = std::make_shared<SymmetryIslandBlock>(
-            pair.first, pair.second);
-        model.symmetryIslands.push_back(islandBlock);
-    }
-    
-    // Create global B*-tree
-    createGlobalBTree();
-    
-    // Initial packing
-    bool packed = PlacementPacker::packSolution(
-        model.allModules, model.symmetryTrees, model.symmetryIslands,
-        model.globalTree, model.globalNodes);
-    
-    if (!packed) {
-        std::cerr << "Warning: Initial packing failed" << std::endl;
-    }
-    
-    // NEW: Validate and repair initial solution
-    bool validSolution = validateAndRepairInitialSolution();
-    if (!validSolution) {
-        std::cerr << "Warning: Could not create a valid initial solution after repair attempts" << std::endl;
     } else {
-        std::cout << "Successfully created a valid initial solution" << std::endl;
-    }
-    
-    // Calculate initial area
-    model.totalArea = PlacementPacker::calculateTotalArea(
-        model.allModules, model.solutionWidth, model.solutionHeight);
-    
-    std::cout << "Initial solution area: " << model.totalArea << std::endl;
-}
-
-void PlacementSolver::createInitialASFBTree(std::shared_ptr<ASFBStarTree> asfTree) {
-    if (!asfTree) return;
-    
-    // Construct an initial tree that satisfies symmetry constraints
-    asfTree->constructInitialTree();
-    
-    // Pack the ASF-B*-tree
-    if (!PlacementPacker::packASFBStarTree(asfTree)) {
-        std::cerr << "Warning: Failed to pack initial ASF-B*-tree" << std::endl;
-    }
-}
-
-bool PlacementSolver::validateAndRepairInitialSolution() {
-    // Check if the initial solution is valid
-    if (validateSolution(model)) {
-        return true;
-    }
-    
-    std::cout << "Initial solution has overlaps, attempting repair..." << std::endl;
-    
-    // Attempt to repair up to 10 times
-    const int MAX_REPAIR_ATTEMPTS = 10;
-    for (int attempt = 0; attempt < MAX_REPAIR_ATTEMPTS; ++attempt) {
-        std::cout << "Repair attempt " << (attempt + 1) << "..." << std::endl;
+        // Module intersects with existing contour
+        if (curr->x > x) {
+            // Insert a new point at the left edge of the module
+            ContourPoint* newPoint = new ContourPoint(x, top);
+            newPoint->next = curr;
+            
+            if (prev) {
+                prev->next = newPoint;
+            } else {
+                contourHead = newPoint;
+            }
+            
+            prev = newPoint;
+        } else if (curr->x == x) {
+            // Update the existing point
+            curr->height = std::max(curr->height, top);
+            prev = curr;
+            curr = curr->next;
+        }
         
-        if (repairInitialSolution()) {
-            if (validateSolution(model)) {
-                std::cout << "Successfully repaired initial solution" << std::endl;
-                return true;
+        // Update or merge intermediate points
+        while (curr != nullptr && curr->x <= right) {
+            if (curr->x == right) {
+                curr->height = std::max(curr->height, top);
+                break;
+            } else {
+                ContourPoint* temp = curr;
+                curr = curr->next;
+                delete temp;
             }
         }
         
-        // Try iterative improvement packing
-        if (PlacementPacker::iterativeImprovementPacking(
-                model.allModules, model.moduleToGroup, 100)) {
-            if (validateSolution(model)) {
-                std::cout << "Successfully fixed initial solution with iterative improvement" << std::endl;
-                return true;
+        if (prev) {
+            prev->next = curr;
+        } else {
+            contourHead = curr;
+        }
+        
+        // If we reached the end without finding a point at 'right'
+        if (curr == nullptr || curr->x > right) {
+            ContourPoint* newPoint = new ContourPoint(right, prev ? prev->height : 0);
+            newPoint->next = curr;
+            
+            if (prev) {
+                prev->next = newPoint;
+            } else {
+                contourHead = newPoint;
             }
         }
     }
-    
-    return false;
 }
 
-bool PlacementSolver::repairInitialSolution() {
-    // Find all overlapping pairs
-    std::vector<std::pair<std::string, std::string>> overlappingPairs;
-    PlacementPacker::findAllOverlappingPairs(
-        model.allModules, model.moduleToGroup, overlappingPairs);
+// Get height of contour at x-coordinate
+int PlacementSolver::getContourHeight(int x) {
+    if (contourHead == nullptr) return 0;
     
-    if (overlappingPairs.empty()) {
-        return true; // No overlaps to fix
+    ContourPoint* curr = contourHead;
+    while (curr->next != nullptr && curr->next->x <= x) {
+        curr = curr->next;
     }
     
-    std::cout << "Found " << overlappingPairs.size() << " overlapping pairs" << std::endl;
-    
-    // Try to resolve each overlap
-    bool anyResolved = false;
-    for (const auto& pair : overlappingPairs) {
-        if (resolveModuleOverlap(pair.first, pair.second)) {
-            anyResolved = true;
-        }
-    }
-    
-    // Re-pack the solution after repairs
-    if (anyResolved) {
-        PlacementPacker::packSolution(
-            model.allModules, model.symmetryTrees, model.symmetryIslands,
-            model.globalTree, model.globalNodes);
-    }
-    
-    return anyResolved;
+    return curr->height;
 }
 
-/**
- * Resolves module overlap by updating both coordinates and tree structure
- * 
- * @param module1Name First module name
- * @param module2Name Second module name
- * @return True if overlap was resolved
- */
-bool PlacementSolver::resolveModuleOverlap(const std::string& module1Name, const std::string& module2Name) {
-    auto it1 = model.allModules.find(module1Name);
-    auto it2 = model.allModules.find(module2Name);
+// Build initial B*-tree for global placement
+void PlacementSolver::buildInitialBStarTree() {
+    // Clean up any existing tree
+    cleanupBStarTree(bstarRoot);
+    bstarRoot = nullptr;
     
-    if (it1 == model.allModules.end() || it2 == model.allModules.end()) {
-        return false;
-    }
-    
-    auto module1 = it1->second;
-    auto module2 = it2->second;
-    
-    std::cout << "Attempting to resolve overlap between " << module1Name << " and " << module2Name << std::endl;
-    
-    // Store original positions
-    int origX1 = module1->getX();
-    int origY1 = module1->getY();
-    int origX2 = module2->getX();
-    int origY2 = module2->getY();
-    
-    // Check if these are regular modules (not part of symmetry groups)
-    bool module1IsRegular = model.regularModules.find(module1Name) != model.regularModules.end();
-    bool module2IsRegular = model.regularModules.find(module2Name) != model.regularModules.end();
-    
-    // We can only directly move regular modules
-    if (!module1IsRegular && !module2IsRegular) {
-        // Can't move symmetry modules directly
-        return false;
-    }
-    
-    // Decide which module to move
-    std::shared_ptr<Module> moduleToMove;
-    std::string moduleToMoveName;
-    
-    if (module1IsRegular) {
-        moduleToMove = module1;
-        moduleToMoveName = module1Name;
-    } else if (module2IsRegular) {
-        moduleToMove = module2;
-        moduleToMoveName = module2Name;
-    } else {
-        return false;
-    }
-    
-    // Get the other module (that we're not moving)
-    std::shared_ptr<Module> otherModule = (moduleToMove == module1) ? module2 : module1;
-    
-    // Try several positions to resolve the overlap
-    const int NUM_ATTEMPTS = 8;
-    const int DISTANCE_STEP = 100; // Larger step for more distance
-    
-    for (int attempt = 0; attempt < NUM_ATTEMPTS; ++attempt) {
-        // Try moving in different directions
-        int dx = (attempt % 4 == 0) ? DISTANCE_STEP * (attempt / 4 + 1) : 
-                 (attempt % 4 == 1) ? -DISTANCE_STEP * (attempt / 4 + 1) : 0;
-        int dy = (attempt % 4 == 2) ? DISTANCE_STEP * (attempt / 4 + 1) : 
-                 (attempt % 4 == 3) ? -DISTANCE_STEP * (attempt / 4 + 1) : 0;
-        
-        // New position is current position of other module plus its size plus offset
-        int newX = otherModule->getX() + otherModule->getWidth() + dx;
-        int newY = otherModule->getY() + otherModule->getHeight() + dy;
-        
-        // Ensure we don't go negative
-        newX = std::max(0, newX);
-        newY = std::max(0, newY);
-        
-        std::cout << "  Trying to move " << moduleToMoveName << " to (" << newX << ", " << newY << ")" << std::endl;
-        
-        // Move the module
-        moduleToMove->setPosition(newX, newY);
-        
-        // Check if this resolves the overlap
-        if (!moduleToMove->overlaps(*otherModule)) {
-            std::cout << "  Successfully resolved overlap!" << std::endl;
-            
-            // Now update the tree structure to reflect this new position
-            updateTreeStructureAfterMovement(moduleToMoveName);
-            
-            return true;
-        }
-    }
-    
-    // If we reach here, we couldn't resolve the overlap with small movements
-    // Try more aggressive strategy: place the module far away
-    int farX = model.solutionWidth + moduleToMove->getWidth() * 2;
-    int farY = model.solutionHeight + moduleToMove->getHeight() * 2;
-    
-    moduleToMove->setPosition(farX, farY);
-    std::cout << "  Moved " << moduleToMoveName << " far away to (" << farX << ", " << farY << ")" << std::endl;
-    
-    // Update the tree structure
-    updateTreeStructureAfterMovement(moduleToMoveName);
-    
-    // This should definitely resolve the overlap
-    return true;
-}
-
-/**
- * Creates a global B*-tree for overall placement
- * This improved implementation uses the restructured B*-tree approach
- */
-void PlacementSolver::createGlobalBTree() {
-    // Create a new restructured B*-tree
-    RestructuredBStarTree restructuredTree;
-    
-    // Combine regular modules and symmetry islands
-    std::map<std::string, int> moduleAreas;
-    
-    // Add regular modules
-    for (const auto& pair : model.regularModules) {
-        std::string nodeName = "reg_" + pair.first;
-        model.globalNodes[nodeName] = pair.second;
-        
-        // Calculate area for sorting
-        int area = pair.second->getWidth() * pair.second->getHeight();
-        moduleAreas[nodeName] = area;
-    }
+    // Get all module and island names
+    std::vector<std::string> entities;
     
     // Add symmetry islands
-    for (const auto& island : model.symmetryIslands) {
-        std::string nodeName = "island_" + island->getName();
-        model.globalNodes[nodeName] = island;
-        
-        // Calculate area for sorting
-        int area = island->getWidth() * island->getHeight();
-        moduleAreas[nodeName] = area;
+    for (size_t i = 0; i < symmetryIslands.size(); i++) {
+        entities.push_back("island_" + std::to_string(i));
     }
     
-    // Create an optimized tree structure based on module areas
-    restructuredTree.createOptimizedTree(moduleAreas);
+    // Add regular modules
+    for (const auto& pair : regularModules) {
+        entities.push_back(pair.first);
+    }
     
-    // Convert the restructured tree to our B*-tree representation
-    model.globalTree = convertRestructuredTreeToGlobalTree(restructuredTree);
+    // Shuffle the entities for randomness
+    std::shuffle(entities.begin(), entities.end(), rng);
     
-    // Now optimize the tree based on spatial relationships if we have initial positions
-    optimizeGlobalTreeStructure();
+    // Create nodes for all entities
+    std::unordered_map<std::string, BStarNode*> nodeMap;
+    for (const auto& name : entities) {
+        bool isIsland = (name.substr(0, 6) == "island_");
+        nodeMap[name] = new BStarNode(name, isIsland);
+    }
+    
+    // Build a random tree
+    if (!entities.empty()) {
+        // Start with a random entity as the root
+        std::string rootName = entities[0];
+        bstarRoot = nodeMap[rootName];
+        
+        // Place remaining entities randomly
+        for (size_t i = 1; i < entities.size(); i++) {
+            // Randomly select an existing node to be the parent
+            std::vector<BStarNode*> potentialParents;
+            std::function<void(BStarNode*)> collectNodes = [&](BStarNode* node) {
+                if (node == nullptr) return;
+                potentialParents.push_back(node);
+                collectNodes(node->left);
+                collectNodes(node->right);
+            };
+            
+            collectNodes(bstarRoot);
+            
+            BStarNode* parent = potentialParents[std::rand() % potentialParents.size()];
+            
+            // Randomly choose left or right child
+            if (std::rand() % 2 == 0 && parent->left == nullptr) {
+                parent->left = nodeMap[entities[i]];
+            } else if (parent->right == nullptr) {
+                parent->right = nodeMap[entities[i]];
+            } else {
+                // Both children occupied, try left
+                parent->left = nodeMap[entities[i]];
+            }
+        }
+    }
 }
 
-/**
- * Converts a RestructuredBStarTree to our global tree representation
- * 
- * @param restructuredTree The restructured B*-tree
- * @return Root node of the converted tree
- */
-std::shared_ptr<BStarTreeNode> PlacementSolver::convertRestructuredTreeToGlobalTree(
-    const RestructuredBStarTree& restructuredTree) {
+// Preorder traversal of B*-tree
+void PlacementSolver::preorder(BStarNode* node) {
+    if (node == nullptr) return;
     
-    // Get all nodes in preorder traversal
-    std::vector<std::shared_ptr<BStarTreeNode>> preorderNodes = 
-        restructuredTree.getAllNodesPreOrder();
+    preorderTraversal.push_back(node);
+    preorder(node->left);
+    preorder(node->right);
+}
+
+// Inorder traversal of B*-tree
+void PlacementSolver::inorder(BStarNode* node) {
+    if (node == nullptr) return;
     
-    if (preorderNodes.empty()) {
-        return nullptr;
+    inorder(node->left);
+    inorderTraversal.push_back(node);
+    inorder(node->right);
+}
+
+// Pack B*-tree to get coordinates
+void PlacementSolver::packBStarTree() {
+    // Clear the contour
+    clearContour();
+    
+    // Update the traversals for the current B*-tree
+    preorderTraversal.clear();
+    inorderTraversal.clear();
+    preorder(bstarRoot);
+    inorder(bstarRoot);
+    
+    // Traverse the tree in preorder
+    std::vector<BStarNode*> nodeStack;
+    if (bstarRoot != nullptr) {
+        nodeStack.push_back(bstarRoot);
     }
     
-    // Create a map to track the converted nodes
-    std::unordered_map<std::string, std::shared_ptr<BStarTreeNode>> convertedNodes;
-    
-    // Create the root node
-    std::shared_ptr<BStarTreeNode> globalRoot = 
-        std::make_shared<BStarTreeNode>(preorderNodes[0]->getModuleName());
-    
-    convertedNodes[globalRoot->getModuleName()] = globalRoot;
-    
-    // Create all other nodes and set up parent-child relationships
-    for (size_t i = 1; i < preorderNodes.size(); i++) {
-        auto originalNode = preorderNodes[i];
-        auto newNode = std::make_shared<BStarTreeNode>(originalNode->getModuleName());
+    while (!nodeStack.empty()) {
+        BStarNode* node = nodeStack.back();
+        nodeStack.pop_back();
         
-        convertedNodes[newNode->getModuleName()] = newNode;
+        int width, height;
+        if (node->isSymmetryIsland) {
+            // Extract island index from name (format: "island_X")
+            size_t islandIndex = std::stoi(node->name.substr(7));
+            if (islandIndex >= symmetryIslands.size()) {
+                continue; // Invalid island index
+            }
+            
+            // Get dimensions from the symmetry island
+            width = symmetryIslands[islandIndex]->getWidth();
+            height = symmetryIslands[islandIndex]->getHeight();
+        } else {
+            // Regular module
+            if (regularModules.find(node->name) == regularModules.end()) {
+                continue; // Module not found
+            }
+            
+            std::shared_ptr<Module> module = regularModules[node->name];
+            width = module->getWidth();
+            height = module->getHeight();
+        }
         
-        // Find parent in original tree
-        std::shared_ptr<BStarTreeNode> originalParent = originalNode->getParent();
-        if (originalParent) {
-            auto it = convertedNodes.find(originalParent->getModuleName());
-            if (it != convertedNodes.end()) {
-                // Set parent-child relationship
-                auto convertedParent = it->second;
-                newNode->setParent(convertedParent);
-                
-                // Determine if left or right child
-                if (originalParent->getLeftChild() && 
-                    originalParent->getLeftChild()->getModuleName() == originalNode->getModuleName()) {
-                    convertedParent->setLeftChild(newNode);
-                } else {
-                    convertedParent->setRightChild(newNode);
+        // Determine x-coordinate from the parent-child relationship
+        int x = 0;
+        if (node != bstarRoot) {
+            bool found = false;
+            for (BStarNode* parent : nodeStack) {
+                if (parent->left == node) {
+                    // Left child: placed to the right of parent
+                    if (parent->isSymmetryIsland) {
+                        size_t parentIslandIndex = std::stoi(parent->name.substr(7));
+                        x = symmetryIslands[parentIslandIndex]->getX() + symmetryIslands[parentIslandIndex]->getWidth();
+                    } else {
+                        std::shared_ptr<Module> parentModule = regularModules[parent->name];
+                        x = parentModule->getX() + parentModule->getWidth();
+                    }
+                    found = true;
+                    break;
+                } else if (parent->right == node) {
+                    // Right child: same x-coordinate as parent
+                    if (parent->isSymmetryIsland) {
+                        size_t parentIslandIndex = std::stoi(parent->name.substr(7));
+                        x = symmetryIslands[parentIslandIndex]->getX();
+                    } else {
+                        std::shared_ptr<Module> parentModule = regularModules[parent->name];
+                        x = parentModule->getX();
+                    }
+                    found = true;
+                    break;
                 }
             }
+            
+            if (!found) {
+                // This should not happen in a valid B*-tree
+                continue;
+            }
         }
-    }
-    
-    return globalRoot;
-}
-
-/**
- * Optimizes the global tree structure based on spatial relationships
- */
-void PlacementSolver::optimizeGlobalTreeStructure() {
-    // Create a map of node positions
-    std::map<std::string, std::pair<int, int>> nodePositions;
-    
-    // Get positions of regular modules
-    for (const auto& pair : model.globalNodes) {
-        std::visit([&](auto&& arg) {
-            using T = std::decay_t<decltype(arg)>;
-            if constexpr (std::is_same_v<T, std::shared_ptr<Module>>) {
-                nodePositions[pair.first] = {arg->getX(), arg->getY()};
-            } else if constexpr (std::is_same_v<T, std::shared_ptr<SymmetryIslandBlock>>) {
-                nodePositions[pair.first] = {arg->getX(), arg->getY()};
-            }
-        }, pair.second);
-    }
-    
-    // Create a restructured tree with these positions
-    RestructuredBStarTree newTree;
-    
-    // First add all nodes
-    std::vector<std::shared_ptr<BStarTreeNode>> preorderNodes;
-    collectGlobalNodesPreOrder(model.globalTree, preorderNodes);
-    
-    for (const auto& node : preorderNodes) {
-        auto newNode = std::make_shared<BStarTreeNode>(node->getModuleName());
-        newTree.addNode(newNode);
-    }
-    
-    // Then optimize based on positions
-    newTree.optimizeTreeFromPositions(nodePositions);
-    
-    // Replace the global tree with the optimized one
-    model.globalTree = convertRestructuredTreeToGlobalTree(newTree);
-}
-
-/**
- * Collects nodes in the global tree in preorder traversal
- * 
- * @param node Current node
- * @param nodes Output vector of nodes
- */
-void PlacementSolver::collectGlobalNodesPreOrder(
-    const std::shared_ptr<BStarTreeNode>& node,
-    std::vector<std::shared_ptr<BStarTreeNode>>& nodes) {
-    
-    if (!node) return;
-    
-    // Root, Left, Right
-    nodes.push_back(node);
-    
-    if (node->getLeftChild()) {
-        collectGlobalNodesPreOrder(node->getLeftChild(), nodes);
-    }
-    
-    if (node->getRightChild()) {
-        collectGlobalNodesPreOrder(node->getRightChild(), nodes);
-    }
-}
-
-/**
- * Rebuilds the global tree after a perturbation to maintain proper structure
- */
-void PlacementSolver::rebuildGlobalTree() {
-    // Only rebuild if we have a tree
-    if (!model.globalTree) return;
-    
-    // Create a restructured tree from the current global tree
-    RestructuredBStarTree restructuredTree;
-    
-    // Collect all nodes
-    std::vector<std::shared_ptr<BStarTreeNode>> nodes;
-    collectGlobalNodesPreOrder(model.globalTree, nodes);
-    
-    for (const auto& node : nodes) {
-        auto newNode = std::make_shared<BStarTreeNode>(node->getModuleName());
-        restructuredTree.addNode(newNode);
-    }
-    
-    // Rebuild the tree
-    restructuredTree.rebuildTree();
-    
-    // Convert back to global tree
-    model.globalTree = convertRestructuredTreeToGlobalTree(restructuredTree);
-}
-
-
-/**
- * Updates the tree structure after moving a module
- * 
- * @param moduleName Name of the moved module
- */
-void PlacementSolver::updateTreeStructureAfterMovement(const std::string& moduleName) {
-    // Find the global node name for this module
-    std::string globalNodeName;
-    for (const auto& pair : model.globalNodes) {
-        bool matches = std::visit([&](auto&& arg) -> bool {
-            using T = std::decay_t<decltype(arg)>;
-            if constexpr (std::is_same_v<T, std::shared_ptr<Module>>) {
-                return arg->getName() == moduleName;
-            }
-            return false;
-        }, pair.second);
         
-        if (matches) {
-            globalNodeName = pair.first;
-            break;
+        // Determine y-coordinate from the contour
+        int y = getContourHeight(x);
+        
+        // Update the position
+        if (node->isSymmetryIsland) {
+            size_t islandIndex = std::stoi(node->name.substr(7));
+            symmetryIslands[islandIndex]->setPosition(x, y);
+        } else {
+            regularModules[node->name]->setPosition(x, y);
+        }
+        
+        // Update the contour
+        updateContour(x, y, width, height);
+        
+        // Add children to the stack (right child first for proper DFS order)
+        if (node->right != nullptr) {
+            nodeStack.push_back(node->right);
+        }
+        if (node->left != nullptr) {
+            nodeStack.push_back(node->left);
         }
     }
-    
-    if (globalNodeName.empty()) {
-        return; // Module not found in global nodes
-    }
-    
-    // Get the current positions of all modules/islands
-    std::map<std::string, std::pair<int, int>> nodePositions;
-    for (const auto& pair : model.globalNodes) {
-        std::visit([&](auto&& arg) {
-            using T = std::decay_t<decltype(arg)>;
-            if constexpr (std::is_same_v<T, std::shared_ptr<Module>>) {
-                nodePositions[pair.first] = {arg->getX(), arg->getY()};
-            } else if constexpr (std::is_same_v<T, std::shared_ptr<SymmetryIslandBlock>>) {
-                nodePositions[pair.first] = {arg->getX(), arg->getY()};
-            }
-        }, pair.second);
-    }
-    
-    // Create a restructured tree and optimize based on current positions
-    RestructuredBStarTree newTree;
-    
-    // Add all nodes
-    std::vector<std::shared_ptr<BStarTreeNode>> preorderNodes;
-    collectGlobalNodesPreOrder(model.globalTree, preorderNodes);
-    
-    for (const auto& node : preorderNodes) {
-        auto newNode = std::make_shared<BStarTreeNode>(node->getModuleName());
-        newTree.addNode(newNode);
-    }
-    
-    // Optimize based on current positions
-    newTree.optimizeTreeFromPositions(nodePositions);
-    
-    // Replace the global tree
-    model.globalTree = convertRestructuredTreeToGlobalTree(newTree);
 }
 
-/**
- * Validates a perturbation move and updates the tree structure if valid
- * 
- * @param fromNodeName Name of node to move
- * @param toNodeName Name of destination parent node
- * @param asLeftChild True if should be left child
- * @return True if move was valid and successful
- */
-bool PlacementSolver::validateAndUpdateTreeStructure(
-    const std::string& fromNodeName, 
-    const std::string& toNodeName,
-    bool asLeftChild) {
+// Calculate bounding box area
+int PlacementSolver::calculateArea() {
+    int minX = 0;
+    int minY = 0;
+    int maxX = 0;
+    int maxY = 0;
     
-    // Find the nodes in the global tree
-    auto fromNode = findNodeInGlobalTree(model.globalTree, fromNodeName);
-    auto toNode = findNodeInGlobalTree(model.globalTree, toNodeName);
-    
-    if (!fromNode || !toNode) {
-        return false;
+    // Check symmetry islands
+    for (const auto& island : symmetryIslands) {
+        maxX = std::max(maxX, island->getX() + island->getWidth());
+        maxY = std::max(maxY, island->getY() + island->getHeight());
     }
     
-    // Create restructured tree
-    RestructuredBStarTree restructuredTree;
-    
-    // Add all nodes
-    std::vector<std::shared_ptr<BStarTreeNode>> preorderNodes;
-    collectGlobalNodesPreOrder(model.globalTree, preorderNodes);
-    
-    for (const auto& node : preorderNodes) {
-        auto newNode = std::make_shared<BStarTreeNode>(node->getModuleName());
-        restructuredTree.addNode(newNode);
+    // Check regular modules
+    for (const auto& pair : regularModules) {
+        const auto& module = pair.second;
+        maxX = std::max(maxX, module->getX() + module->getWidth());
+        maxY = std::max(maxY, module->getY() + module->getHeight());
     }
     
-    // Perform the move in the restructured tree
-    auto restructuredFromNode = restructuredTree.findNode(fromNodeName);
-    auto restructuredToNode = restructuredTree.findNode(toNodeName);
+    return maxX * maxY;
+}
+
+// Calculate half-perimeter wirelength (placeholder)
+double PlacementSolver::calculateWirelength() {
+    // This is a placeholder - in a real implementation, you would calculate
+    // the wirelength based on module connectivity information
     
-    if (!restructuredFromNode || !restructuredToNode) {
-        return false;
+    // For this simplified version, we'll use a proxy: sum of distances from modules to the origin
+    double wirelength = 0.0;
+    
+    // Include symmetry islands
+    for (const auto& island : symmetryIslands) {
+        wirelength += island->getX() + island->getY();
     }
     
-    bool success = restructuredTree.moveNode(restructuredFromNode, restructuredToNode, asLeftChild);
+    // Include regular modules
+    for (const auto& pair : regularModules) {
+        const auto& module = pair.second;
+        wirelength += module->getX() + module->getY();
+    }
     
-    if (success) {
-        // Update the global tree
-        model.globalTree = convertRestructuredTreeToGlobalTree(restructuredTree);
+    return wirelength;
+}
+
+// Calculate cost of current solution
+double PlacementSolver::calculateCost() {
+    int area = calculateArea();
+    double wirelength = calculateWirelength();
+    
+    return areaWeight * area + wirelengthWeight * wirelength;
+}
+
+// Perform random perturbation
+bool PlacementSolver::perturb() {
+    double rand = static_cast<double>(std::rand()) / RAND_MAX;
+    double cumulativeProb = 0.0;
+    
+    // Backup the tree structure before any perturbation
+    backupBStarTree();
+    
+    bool success = false;
+    
+    // Select perturbation type based on probabilities
+    if ((cumulativeProb += rotateProb) > rand) {
+        // Rotate a module
+        BStarNode* node = findRandomNode();
+        if (node) {
+            success = rotateModule(node->isSymmetryIsland, node->name);
+        }
+    } else if ((cumulativeProb += moveProb) > rand) {
+        // Move a node
+        BStarNode* node = findRandomNode();
+        if (node) {
+            success = moveNode(node);
+        }
+    } else if ((cumulativeProb += swapProb) > rand) {
+        // Swap two nodes
+        success = swapNodes();
+    } else if ((cumulativeProb += changeRepProb) > rand) {
+        // Change representative
+        success = changeRepresentative();
+    } else if ((cumulativeProb += convertSymProb) > rand) {
+        // Convert symmetry type
+        success = convertSymmetryType();
+    }
+    
+    // Validate the tree after perturbation
+    if (success && !validateBStarTree()) {
+        // If validation fails, restore from backup
+        restoreBStarTree();
+        success = false;
     }
     
     return success;
 }
 
-/**
- * Finds a node in the global tree by name
- * 
- * @param root Root of the tree
- * @param nodeName Name to search for
- * @return Found node or nullptr
- */
-std::shared_ptr<BStarTreeNode> PlacementSolver::findNodeInGlobalTree(
-    const std::shared_ptr<BStarTreeNode>& root, 
-    const std::string& nodeName) {
-    
-    if (!root) return nullptr;
-    
-    if (root->getModuleName() == nodeName) {
-        return root;
-    }
-    
-    auto leftResult = findNodeInGlobalTree(root->getLeftChild(), nodeName);
-    if (leftResult) {
-        return leftResult;
-    }
-    
-    return findNodeInGlobalTree(root->getRightChild(), nodeName);
-}
-
-bool PlacementSolver::performRandomPerturbation() {
-    // First, check if there are any overlaps that need targeted resolution
-    std::vector<std::pair<std::string, std::string>> overlappingPairs;
-    PlacementPacker::findAllOverlappingPairs(model.allModules, model.moduleToGroup, overlappingPairs);
-    
-    // If there are overlaps and we hit a probability threshold, resolve them specifically
-    bool hasOverlaps = !overlappingPairs.empty();
-    double randVal = uniformDist(rng);
-    
-    // With 20% probability, attempt targeted overlap resolution if overlaps exist
-    if (hasOverlaps && randVal < 0.2) {
-        // Choose a random overlapping pair
-        int pairIndex = uniformDist(rng) * overlappingPairs.size();
-        const auto& [module1, module2] = overlappingPairs[pairIndex];
-        
-        std::cout << "Performing targeted resolution for modules " << module1 << " and " << module2 << std::endl;
-        
-        // Attempt to resolve this specific overlap
-        bool success = resolveModuleOverlap(module1, module2);
-        
-        // If successful, repack to update positions
-        if (success) {
-            PlacementPacker::packSolution(
-                model.allModules, model.symmetryTrees, model.symmetryIslands,
-                model.globalTree, model.globalNodes);
+// Rotate a module
+bool PlacementSolver::rotateModule(bool isSymmetryIsland, const std::string& name) {
+    if (isSymmetryIsland) {
+        // Extract island index
+        size_t islandIndex = std::stoi(name.substr(7));
+        if (islandIndex < symmetryIslands.size()) {
+            // Rotate the symmetry island
+            symmetryIslands[islandIndex]->rotate();
             return true;
         }
-        
-        // If that fails, try iterative improvement
-        if (PlacementPacker::iterativeImprovementPacking(
-                model.allModules, model.moduleToGroup, 20)) {
-            PlacementPacker::packSolution(
-                model.allModules, model.symmetryTrees, model.symmetryIslands,
-                model.globalTree, model.globalNodes);
+    } else {
+        // Rotate a regular module
+        if (regularModules.find(name) != regularModules.end()) {
+            regularModules[name]->rotate();
             return true;
-        }
-    }
-    
-    // Otherwise, perform regular perturbation
-    // Choose a perturbation type based on probabilities
-    randVal = uniformDist(rng);
-    
-    if (randVal < probRotate) {
-        // Rotate a module
-        if (!model.regularModules.empty() && uniformDist(rng) < 0.5) {
-            // Rotate a regular module
-            auto it = model.regularModules.begin();
-            std::advance(it, uniformDist(rng) * model.regularModules.size());
-            
-            return PlacementPerturber::rotateModule(it->second);
-        } 
-        else if (!model.symmetryTrees.empty()) {
-            // Rotate a module in a symmetry group
-            auto it = model.symmetryTrees.begin();
-            std::advance(it, uniformDist(rng) * model.symmetryTrees.size());
-            
-            // Get a random module from the symmetry group
-            auto& modules = it->second->getModules();
-            if (!modules.empty()) {
-                auto moduleIt = modules.begin();
-                std::advance(moduleIt, uniformDist(rng) * modules.size());
-                
-                return PlacementPerturber::rotateSymmetryModule(it->second, moduleIt->first);
-            }
-        }
-    } 
-    else if (randVal < probRotate + probMove) {
-        // Try to perturb the global tree
-        return PlacementPerturber::perturbGlobalTree(
-            model.globalTree, model.globalNodes, rng);
-    } 
-    else if (randVal < probRotate + probMove + probSwap) {
-        // Swap modules
-        if (!model.regularModules.empty() && model.regularModules.size() >= 2) {
-            // Swap two regular modules
-            std::vector<std::string> regularModuleNames;
-            for (const auto& pair : model.regularModules) {
-                regularModuleNames.push_back(pair.first);
-            }
-            
-            int idx1 = uniformDist(rng) * regularModuleNames.size();
-            int idx2;
-            do {
-                idx2 = uniformDist(rng) * regularModuleNames.size();
-            } while (idx2 == idx1);
-            
-            std::string name1 = regularModuleNames[idx1];
-            std::string name2 = regularModuleNames[idx2];
-            
-            auto module1 = model.regularModules[name1];
-            auto module2 = model.regularModules[name2];
-            
-            return PlacementPerturber::swapModules(module1, module2);
-        }
-    } 
-    else if (randVal < probRotate + probMove + probSwap + probChangeRep) {
-        // Change representative in symmetry group
-        if (!model.symmetryTrees.empty()) {
-            auto it = model.symmetryTrees.begin();
-            std::advance(it, uniformDist(rng) * model.symmetryTrees.size());
-            
-            // Get a random symmetry pair
-            auto group = it->second->getSymmetryGroup();
-            const auto& pairs = group->getSymmetryPairs();
-            if (!pairs.empty()) {
-                int pairIndex = uniformDist(rng) * pairs.size();
-                const auto& pair = pairs[pairIndex];
-                
-                // Choose one of the modules in the pair
-                std::string moduleName = (uniformDist(rng) < 0.5) ? pair.first : pair.second;
-                
-                return PlacementPerturber::changeRepresentative(it->second, moduleName);
-            }
-        }
-    } 
-    else {
-        // Convert symmetry type
-        if (!model.symmetryTrees.empty()) {
-            auto it = model.symmetryTrees.begin();
-            std::advance(it, uniformDist(rng) * model.symmetryTrees.size());
-            
-            return PlacementPerturber::convertSymmetryType(it->second);
         }
     }
     
     return false;
 }
 
-
-int PlacementSolver::calculateCost(const PlacementModel& model) {
-    // For now, just use the area as the cost
-    // In a more complex implementation, this would include wirelength
-    return model.totalArea;
-}
-
-void PlacementSolver::saveSolution(const PlacementModel& source, PlacementModel& destination) {
-    // Create a deep copy of the solution
-    destination = source.clone();
-}
-
-void PlacementSolver::restoreSolution(PlacementModel& destination, const PlacementModel& source) {
-    // Restore solution from a saved copy
-    destination = source.clone();
-}
-
-bool PlacementSolver::validateSolution(const PlacementModel& model) {
-    // Check for overlaps at the global level
-    if (PlacementPacker::hasGlobalOverlaps(model.allModules, model.moduleToGroup, model.symmetryIslands)) {
+// Move a node in the B*-tree
+bool PlacementSolver::moveNode(BStarNode* node) {
+    if (node == nullptr || node == bstarRoot) {
         return false;
     }
     
-    // Validate symmetry constraints
-    if (!PlacementPacker::validateSymmetryConstraints(model.allModules, model.symmetryTrees)) {
+    // Before perturbation, backup the tree structure
+    backupBStarTree();
+    
+    // Find the parent of the node to move
+    BStarNode* parent = nullptr;
+    BStarNode* current = bstarRoot;
+    std::queue<BStarNode*> queue;
+    queue.push(current);
+    
+    while (!queue.empty()) {
+        current = queue.front();
+        queue.pop();
+        
+        if (current->left == node || current->right == node) {
+            parent = current;
+            break;
+        }
+        
+        if (current->left) queue.push(current->left);
+        if (current->right) queue.push(current->right);
+    }
+    
+    if (parent == nullptr) {
+        return false;
+    }
+    
+    // Detach node from its parent
+    if (parent->left == node) {
+        parent->left = nullptr;
+    } else {
+        parent->right = nullptr;
+    }
+    
+    // Find potential new parents (exclude descendants of node to prevent cycles)
+    std::vector<BStarNode*> potentialParents;
+    std::unordered_set<BStarNode*> descendants;
+    
+    // First collect all descendants of the node
+    std::function<void(BStarNode*)> collectDescendants = [&](BStarNode* n) {
+        if (n == nullptr) return;
+        descendants.insert(n);
+        collectDescendants(n->left);
+        collectDescendants(n->right);
+    };
+    collectDescendants(node);
+    
+    // Now collect all nodes that are not descendants
+    std::function<void(BStarNode*)> collectNonDescendants = [&](BStarNode* n) {
+        if (n == nullptr) return;
+        if (descendants.find(n) == descendants.end()) {
+            potentialParents.push_back(n);
+        }
+        collectNonDescendants(n->left);
+        collectNonDescendants(n->right);
+    };
+    collectNonDescendants(bstarRoot);
+    
+    if (potentialParents.empty()) {
+        // Restore original connection and return failure
+        if (parent->left == nullptr) {
+            parent->left = node;
+        } else {
+            parent->right = node;
+        }
+        return false;
+    }
+    
+    // Try to find a parent with an available child slot
+    bool placed = false;
+    std::random_device rd;
+    std::mt19937 g(rd());
+    std::shuffle(potentialParents.begin(), potentialParents.end(), g);
+    
+    for (BStarNode* newParent : potentialParents) {
+        // Try left child first if it's empty
+        if (newParent->left == nullptr) {
+            newParent->left = node;
+            placed = true;
+            break;
+        }
+        // Try right child if it's empty
+        else if (newParent->right == nullptr) {
+            newParent->right = node;
+            placed = true;
+            break;
+        }
+    }
+    
+    // If we couldn't place the node (all potential parents have both children),
+    // find a leaf node to attach to
+    if (!placed) {
+        // Find leaf nodes (nodes with at least one nullptr child)
+        std::vector<BStarNode*> leafNodes;
+        for (BStarNode* potential : potentialParents) {
+            if (potential->left == nullptr || potential->right == nullptr) {
+                leafNodes.push_back(potential);
+            }
+        }
+        
+        if (!leafNodes.empty()) {
+            // Select a random leaf node
+            BStarNode* leafNode = leafNodes[std::rand() % leafNodes.size()];
+            
+            // Add to whichever child pointer is nullptr
+            if (leafNode->left == nullptr) {
+                leafNode->left = node;
+                placed = true;
+            } else if (leafNode->right == nullptr) {
+                leafNode->right = node;
+                placed = true;
+            }
+        }
+    }
+    
+    // If still not placed, restore original position and return failure
+    if (!placed) {
+        if (parent->left == nullptr) {
+            parent->left = node;
+        } else {
+            parent->right = node;
+        }
+        return false;
+    }
+    
+    // Validate the resulting tree structure
+    if (!validateBStarTree()) {
+        // If invalid, restore from backup and return failure
+        restoreBStarTree();
         return false;
     }
     
     return true;
 }
 
-void PlacementSolver::setAnnealingParameters(double initialTemp, double finalTemp, double coolRate, 
-                                           int iterations, int noImprovementLimit) {
+// Swap two nodes in the B*-tree
+bool PlacementSolver::swapNodes() {
+    // Need at least 2 nodes
+    if (preorderTraversal.size() < 2) {
+        return false;
+    }
+    
+    // Select two random nodes
+    int idx1 = std::rand() % preorderTraversal.size();
+    int idx2;
+    do {
+        idx2 = std::rand() % preorderTraversal.size();
+    } while (idx1 == idx2);
+    
+    BStarNode* node1 = preorderTraversal[idx1];
+    BStarNode* node2 = preorderTraversal[idx2];
+    
+    // Swap node contents (name and isSymmetryIsland flag)
+    std::swap(node1->name, node2->name);
+    std::swap(node1->isSymmetryIsland, node2->isSymmetryIsland);
+    
+    return true;
+}
+
+// Change representative for a symmetry pair
+bool PlacementSolver::changeRepresentative() {
+    // Select a random symmetry island
+    if (symmetryIslands.empty()) {
+        return false;
+    }
+    
+    size_t islandIndex = std::rand() % symmetryIslands.size();
+    auto island = symmetryIslands[islandIndex];
+    
+    // Get the ASF-B*-tree from the island
+    auto asfBStarTree = island->getASFBStarTree();
+    
+    // Perturb the ASF-B*-tree by changing a representative
+    return asfBStarTree->perturb(3); // Type 3 is "change representative"
+}
+
+// Convert symmetry type for a symmetry group
+bool PlacementSolver::convertSymmetryType() {
+    // Select a random symmetry island
+    if (symmetryIslands.empty()) {
+        return false;
+    }
+    
+    size_t islandIndex = std::rand() % symmetryIslands.size();
+    auto island = symmetryIslands[islandIndex];
+    
+    // Get the ASF-B*-tree from the island
+    auto asfBStarTree = island->getASFBStarTree();
+    
+    // Perturb the ASF-B*-tree by converting symmetry type
+    return asfBStarTree->perturb(4); // Type 4 is "convert symmetry type"
+}
+
+// Added tree validation for PlacementSolver
+bool PlacementSolver::validateBStarTree() {
+    if (bstarRoot == nullptr) return true;
+    
+    // Set to keep track of visited nodes
+    std::unordered_set<BStarNode*> visited;
+    
+    // Function to check for cycles in the tree
+    std::function<bool(BStarNode*, std::unordered_set<BStarNode*>&)> hasNoCycles =
+        [&](BStarNode* current, std::unordered_set<BStarNode*>& path) -> bool {
+            if (current == nullptr) return true;
+            
+            // If we've seen this node in the current path, we have a cycle
+            if (path.find(current) != path.end()) {
+                return false;
+            }
+            
+            // Add this node to the current path
+            path.insert(current);
+            visited.insert(current);
+            
+            // Check children
+            bool leftValid = hasNoCycles(current->left, path);
+            bool rightValid = hasNoCycles(current->right, path);
+            
+            // Remove this node from the current path (backtracking)
+            path.erase(current);
+            
+            return leftValid && rightValid;
+        };
+    
+    // Start DFS from the root to check for cycles
+    std::unordered_set<BStarNode*> path;
+    bool noCycles = hasNoCycles(bstarRoot, path);
+    
+    // Make sure each node in the tree is reachable from the root
+    // First count all nodes in the tree
+    size_t totalNodes = 0;
+    std::function<void(BStarNode*)> countNodes = [&](BStarNode* n) {
+        if (n == nullptr) return;
+        totalNodes++;
+        countNodes(n->left);
+        countNodes(n->right);
+    };
+    countNodes(bstarRoot);
+    
+    // Make sure we visited all nodes in the cycle check
+    return noCycles && (visited.size() == totalNodes);
+}
+
+// Methods for backing up and restoring B*-tree structure in PlacementSolver
+void PlacementSolver::backupBStarTree() {
+    // Store the current tree structure
+    bstarTreeBackup.preorderNodes.clear();
+    bstarTreeBackup.inorderNodes.clear();
+    
+    // Populate the backup traversals
+    std::function<void(BStarNode*)> preorderBackup = [&](BStarNode* node) {
+        if (node == nullptr) return;
+        bstarTreeBackup.preorderNodes.push_back({node->name, node->isSymmetryIsland});
+        preorderBackup(node->left);
+        preorderBackup(node->right);
+    };
+    
+    std::function<void(BStarNode*)> inorderBackup = [&](BStarNode* node) {
+        if (node == nullptr) return;
+        inorderBackup(node->left);
+        bstarTreeBackup.inorderNodes.push_back({node->name, node->isSymmetryIsland});
+        inorderBackup(node->right);
+    };
+    
+    preorderBackup(bstarRoot);
+    inorderBackup(bstarRoot);
+}
+
+// Restore B*-tree from backup
+void PlacementSolver::restoreBStarTree() {
+    if (bstarTreeBackup.preorderNodes.empty() || bstarTreeBackup.inorderNodes.empty()) {
+        return; // No backup available
+    }
+    
+    // Clean up existing tree
+    cleanupBStarTree(bstarRoot);
+    bstarRoot = nullptr;
+    
+    // Create nodes for all entities
+    std::unordered_map<std::string, BStarNode*> nodeMap;
+    for (const auto& info : bstarTreeBackup.preorderNodes) {
+        if (nodeMap.find(info.name) == nodeMap.end()) {
+            nodeMap[info.name] = new BStarNode(info.name, info.isIsland);
+        }
+    }
+    
+    // Create mapping from name to inorder index
+    std::unordered_map<std::string, size_t> inorderMap;
+    for (size_t i = 0; i < bstarTreeBackup.inorderNodes.size(); i++) {
+        inorderMap[bstarTreeBackup.inorderNodes[i].name] = i;
+    }
+    
+    // Recursive function to rebuild the tree
+    std::function<BStarNode*(size_t&, size_t, size_t)> rebuildTree = 
+        [&](size_t& preIdx, size_t inStart, size_t inEnd) -> BStarNode* {
+            if (inStart > inEnd || preIdx >= bstarTreeBackup.preorderNodes.size()) {
+                return nullptr;
+            }
+            
+            // Get the root of current subtree from preorder traversal
+            const auto& nodeInfo = bstarTreeBackup.preorderNodes[preIdx++];
+            BStarNode* node = nodeMap[nodeInfo.name];
+            
+            // If this is the only element in this subtree
+            if (inStart == inEnd) {
+                return node;
+            }
+            
+            // Find the index of current node in inorder traversal
+            size_t inIndex = inorderMap[nodeInfo.name];
+            
+            // Recursively build left and right subtrees
+            if (inIndex > inStart) {
+                node->left = rebuildTree(preIdx, inStart, inIndex - 1);
+            }
+            if (inIndex < inEnd) {
+                node->right = rebuildTree(preIdx, inIndex + 1, inEnd);
+            }
+            
+            return node;
+        };
+    
+    // Rebuild the tree
+    size_t preIdx = 0;
+    bstarRoot = rebuildTree(preIdx, 0, bstarTreeBackup.inorderNodes.size() - 1);
+}
+
+// Check for module overlaps
+bool PlacementSolver::hasOverlaps() {
+    // Check overlaps between regular modules
+    for (const auto& pair1 : regularModules) {
+        const auto& module1 = pair1.second;
+        
+        // Check against other regular modules
+        for (const auto& pair2 : regularModules) {
+            if (pair1.first == pair2.first) continue; // Skip self
+            
+            const auto& module2 = pair2.second;
+            if (module1->overlaps(*module2)) {
+                return true;
+            }
+        }
+        
+        // Check against symmetry islands
+        for (const auto& island : symmetryIslands) {
+            if (island->overlaps(*module1)) {
+                return true;
+            }
+        }
+    }
+    
+    // Check overlaps between symmetry islands
+    for (size_t i = 0; i < symmetryIslands.size(); i++) {
+        for (size_t j = i + 1; j < symmetryIslands.size(); j++) {
+            if (symmetryIslands[i]->overlaps(*symmetryIslands[j])) {
+                return true;
+            }
+        }
+    }
+    
+    return false;
+}
+
+// Deep copy of module data
+std::map<std::string, std::shared_ptr<Module>> PlacementSolver::copyModules(
+    const std::map<std::string, std::shared_ptr<Module>>& source) {
+    
+    std::map<std::string, std::shared_ptr<Module>> result;
+    
+    for (const auto& pair : source) {
+        result[pair.first] = std::make_shared<Module>(*pair.second);
+    }
+    
+    return result;
+}
+
+// Find a random node in the B*-tree
+PlacementSolver::BStarNode* PlacementSolver::findRandomNode() {
+    if (preorderTraversal.empty()) {
+        return nullptr;
+    }
+    
+    return preorderTraversal[std::rand() % preorderTraversal.size()];
+}
+
+// Copy current solution to best solution
+void PlacementSolver::updateBestSolution() {
+    bestSolutionArea = solutionArea;
+    bestSolutionWirelength = solutionWirelength;
+    
+    // Update all modules in the solution
+    bestSolutionModules.clear();
+    
+    // Add regular modules
+    for (const auto& pair : regularModules) {
+        bestSolutionModules[pair.first] = std::make_shared<Module>(*pair.second);
+    }
+    
+    // Add modules from symmetry islands
+    for (const auto& island : symmetryIslands) {
+        for (const auto& pair : island->getASFBStarTree()->getModules()) {
+            bestSolutionModules[pair.first] = std::make_shared<Module>(*pair.second);
+        }
+    }
+}
+
+// Copy best solution to current solution
+void PlacementSolver::restoreBestSolution() {
+    // Restore module positions from best solution
+    for (const auto& pair : bestSolutionModules) {
+        const std::string& name = pair.first;
+        const auto& module = pair.second;
+        
+        // Check if it's a regular module
+        if (regularModules.find(name) != regularModules.end()) {
+            regularModules[name]->setPosition(module->getX(), module->getY());
+            regularModules[name]->setRotation(module->getRotated());
+        } else {
+            // It's in a symmetry island - find and update it
+            for (const auto& island : symmetryIslands) {
+                const auto& islandModules = island->getASFBStarTree()->getModules();
+                if (islandModules.find(name) != islandModules.end()) {
+                    islandModules.at(name)->setPosition(module->getX(), module->getY());
+                    islandModules.at(name)->setRotation(module->getRotated());
+                    break;
+                }
+            }
+        }
+    }
+    
+    // Update solution metrics
+    solutionArea = bestSolutionArea;
+    solutionWirelength = bestSolutionWirelength;
+}
+
+// Load the problem data
+bool PlacementSolver::loadProblem(
+    const std::map<std::string, std::shared_ptr<Module>>& modules,
+    const std::vector<std::shared_ptr<SymmetryGroup>>& symmetryGroups) {
+    
+    // Clear current data
+    this->modules = modules;
+    this->symmetryGroups = symmetryGroups;
+    
+    regularModules.clear();
+    symmetryIslands.clear();
+    
+    // Create symmetry islands
+    for (size_t i = 0; i < symmetryGroups.size(); i++) {
+        auto symmetryGroup = symmetryGroups[i];
+        
+        // Collect modules in this symmetry group
+        std::map<std::string, std::shared_ptr<Module>> groupModules;
+        
+        // Add symmetry pairs
+        for (const auto& pair : symmetryGroup->getSymmetryPairs()) {
+            if (modules.find(pair.first) != modules.end()) {
+                groupModules[pair.first] = modules.at(pair.first);
+            }
+            if (modules.find(pair.second) != modules.end()) {
+                groupModules[pair.second] = modules.at(pair.second);
+            }
+        }
+        
+        // Add self-symmetric modules
+        for (const auto& name : symmetryGroup->getSelfSymmetric()) {
+            if (modules.find(name) != modules.end()) {
+                groupModules[name] = modules.at(name);
+            }
+        }
+        
+        // Create ASF-B*-tree for this symmetry group
+        auto asfBStarTree = std::make_shared<ASFBStarTree>(symmetryGroup, groupModules);
+        
+        // Pack the ASF-B*-tree to get initial layout
+        asfBStarTree->pack();
+        
+        // Create symmetry island
+        auto island = std::make_shared<SymmetryIslandBlock>("sg_" + std::to_string(i), asfBStarTree);
+        
+        // Update bounding box
+        island->updateBoundingBox();
+        
+        symmetryIslands.push_back(island);
+    }
+    
+    // Collect regular modules (not in any symmetry group)
+    std::unordered_set<std::string> symmetryModules;
+    
+    for (const auto& group : symmetryGroups) {
+        for (const auto& pair : group->getSymmetryPairs()) {
+            symmetryModules.insert(pair.first);
+            symmetryModules.insert(pair.second);
+        }
+        for (const auto& name : group->getSelfSymmetric()) {
+            symmetryModules.insert(name);
+        }
+    }
+    
+    for (const auto& pair : modules) {
+        if (symmetryModules.find(pair.first) == symmetryModules.end()) {
+            regularModules[pair.first] = pair.second;
+        }
+    }
+    
+    // Build initial B*-tree for global placement
+    buildInitialBStarTree();
+    
+    return true;
+}
+
+// Set simulated annealing parameters
+void PlacementSolver::setAnnealingParameters(
+    double initialTemp, double finalTemp, double cooling,
+    int iterations, int noImprovementLimit) {
+    
     initialTemperature = initialTemp;
     finalTemperature = finalTemp;
-    coolingRate = coolRate;
+    coolingRate = cooling;
     iterationsPerTemperature = iterations;
     this->noImprovementLimit = noImprovementLimit;
 }
 
-void PlacementSolver::setPerturbationProbabilities(double rotate, double move, double swap, 
-                                                 double changeRep, double convertSym) {
-    // Check if probabilities sum to 1.0
-    double sum = rotate + move + swap + changeRep + convertSym;
-    if (std::abs(sum - 1.0) > 1e-6) {
-        // Normalize probabilities to sum to 1.0
-        if (sum <= 0.0) {
-            // Default values if all probabilities are zero or negative
-            probRotate = 0.4;
-            probMove = 0.3;
-            probSwap = 0.2;
-            probChangeRep = 0.05;
-            probConvertSym = 0.05;
-            return;
-        }
-        
-        probRotate = rotate / sum;
-        probMove = move / sum;
-        probSwap = swap / sum;
-        probChangeRep = changeRep / sum;
-        probConvertSym = convertSym / sum;
-    } else {
-        probRotate = rotate;
-        probMove = move;
-        probSwap = swap;
-        probChangeRep = changeRep;
-        probConvertSym = convertSym;
-    }
+// Set perturbation probabilities
+void PlacementSolver::setPerturbationProbabilities(
+    double rotate, double move, double swap,
+    double changeRep, double convertSym) {
+    
+    rotateProb = rotate;
+    moveProb = move;
+    swapProb = swap;
+    changeRepProb = changeRep;
+    convertSymProb = convertSym;
 }
 
-void PlacementSolver::setCostWeights(double area, double wirelength) {
-    areaWeight = area;
-    wirelengthWeight = wirelength;
+// Set cost weights
+void PlacementSolver::setCostWeights(double areaWeight, double wirelengthWeight) {
+    this->areaWeight = areaWeight;
+    this->wirelengthWeight = wirelengthWeight;
 }
 
+// Set random seed
 void PlacementSolver::setRandomSeed(unsigned int seed) {
-    randomSeed = seed;
-    rng.seed(randomSeed);
+    rng.seed(seed);
+    std::srand(seed);
 }
 
+// Set time limit
 void PlacementSolver::setTimeLimit(int seconds) {
     timeLimit = seconds;
 }
 
+// Solve the placement problem
 bool PlacementSolver::solve() {
-    // Create initial solution
-    createInitialSolution();
+    // Record start time
+    startTime = std::chrono::steady_clock::now();
     
-    if (model.allModules.empty()) {
-        std::cerr << "Error: No modules to place." << std::endl;
-        return false;
-    }
+    // Initial packing
+    packBStarTree();
     
-    // Setup simulated annealing
-    std::cout << "Starting simulated annealing..." << std::endl;
+    // Calculate initial solution metrics
+    solutionArea = calculateArea();
+    solutionWirelength = calculateWirelength();
     
-    // Define cost function
-    auto costFunction = [](const PlacementModel& model) -> int {
-        // Calculate area (we could add wirelength here in the future)
-        int width, height;
-        return PlacementPacker::calculateTotalArea(
-            model.allModules, width, height);
-    };
+    // Initialize best solution
+    bestSolutionArea = solutionArea;
+    bestSolutionWirelength = solutionWirelength;
+    updateBestSolution();
     
-    // Define perturbation function
-    auto perturbFunction = [this](PlacementModel& model) -> bool {
-        // Perform a random perturbation
-        bool success = this->performRandomPerturbation();
+    // Also backup the initial tree structure
+    backupBStarTree();
+    bestBStarTreeBackup = bstarTreeBackup;
+    
+    std::cout << "Initial solution - Area: " << solutionArea << ", Cost: " << calculateCost() << std::endl;
+    
+    // Simulated annealing
+    double temperature = initialTemperature;
+    int iterations = 0;
+    int noImprovementCount = 0;
+    
+    while (temperature > finalTemperature && noImprovementCount < noImprovementLimit) {
+        bool improved = false;
         
-        // If perturbation succeeded, repack the solution
-        if (success) {
-            PlacementPacker::packSolution(
-                model.allModules, model.symmetryTrees, model.symmetryIslands,
-                model.globalTree, model.globalNodes);
+        for (int i = 0; i < iterationsPerTemperature; i++) {
+            // Check time limit
+            auto currentTime = std::chrono::steady_clock::now();
+            double elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+                currentTime - startTime).count();
+            
+            if (elapsed >= timeLimit) {
+                std::cout << "Time limit reached." << std::endl;
+                break;
+            }
+            
+            // Save current state and metrics
+            int oldArea = solutionArea;
+            double oldWirelength = solutionWirelength;
+            double oldCost = calculateCost();
+            
+            // Backup current tree structure
+            backupBStarTree();
+            
+            // Create backup of module positions
+            std::map<std::string, std::pair<int, int>> oldPositions;
+            std::map<std::string, bool> oldRotations;
+            
+            for (const auto& pair : regularModules) {
+                oldPositions[pair.first] = {pair.second->getX(), pair.second->getY()};
+                oldRotations[pair.first] = pair.second->getRotated();
+            }
+            
+            // Create backup of islands
+            std::vector<std::pair<int, int>> oldIslandPositions;
+            for (const auto& island : symmetryIslands) {
+                oldIslandPositions.push_back({island->getX(), island->getY()});
+            }
+            
+            // Perturb the solution
+            bool perturbSuccess = perturb();
+            
+            if (perturbSuccess) {
+                // Re-pack
+                packBStarTree();
+                
+                // Calculate new metrics
+                int newArea = calculateArea();
+                double newWirelength = calculateWirelength();
+                double newCost = areaWeight * newArea + wirelengthWeight * newWirelength;
+                
+                // Check if we should accept this solution
+                double costDelta = newCost - oldCost;
+                bool accept = false;
+                
+                if (costDelta <= 0) {
+                    // Accept improvement
+                    accept = true;
+                    
+                    if (newArea < bestSolutionArea) {
+                        // Found a new best solution
+                        bestSolutionArea = newArea;
+                        bestSolutionWirelength = newWirelength;
+                        updateBestSolution();
+                        bestBStarTreeBackup = bstarTreeBackup; // Save tree structure too
+                        improved = true;
+                        noImprovementCount = 0;
+                        
+                        std::cout << "New best solution - Area: " << newArea 
+                                  << ", Cost: " << newCost 
+                                  << ", Temp: " << temperature << std::endl;
+                    }
+                } else {
+                    // Accept with probability based on temperature
+                    double acceptProb = exp(-costDelta / temperature);
+                    if (static_cast<double>(std::rand()) / RAND_MAX < acceptProb) {
+                        accept = true;
+                    }
+                }
+                
+                if (accept) {
+                    // Update solution metrics
+                    solutionArea = newArea;
+                    solutionWirelength = newWirelength;
+                } else {
+                    // Restore the tree structure
+                    restoreBStarTree();
+                    
+                    // Restore old positions
+                    for (const auto& pair : oldPositions) {
+                        if (regularModules.find(pair.first) != regularModules.end()) {
+                            regularModules[pair.first]->setPosition(pair.second.first, pair.second.second);
+                            regularModules[pair.first]->setRotation(oldRotations[pair.first]);
+                        }
+                    }
+                    
+                    // Restore islands
+                    for (size_t i = 0; i < symmetryIslands.size(); i++) {
+                        symmetryIslands[i]->setPosition(oldIslandPositions[i].first, oldIslandPositions[i].second);
+                    }
+                    
+                    // Restore metrics
+                    solutionArea = oldArea;
+                    solutionWirelength = oldWirelength;
+                }
+            }
+            
+            iterations++;
         }
         
-        return success;
-    };
-    
-    // Define solution save/restore functions
-    auto saveFunction = [this](const PlacementModel& source, PlacementModel& destination) {
-        this->saveSolution(source, destination);
-    };
-    
-    auto restoreFunction = [this](PlacementModel& destination, const PlacementModel& source) {
-        this->restoreSolution(destination, source);
-    };
-    
-    // Define validation function
-    auto validateFunction = [this](const PlacementModel& model) -> bool {
-        return this->validateSolution(model);
-    };
-    
-    // Create simulated annealing object
-    SimulatedAnnealing<PlacementModel, int> sa(
-        model, costFunction, perturbFunction, saveFunction, restoreFunction, validateFunction,
-        initialTemperature, finalTemperature, coolingRate, 
-        iterationsPerTemperature, noImprovementLimit, timeLimit);
-    
-    // Set random seed
-    sa.setSeed(randomSeed);
-    
-    // Run simulated annealing
-    PlacementModel bestSolution = sa.optimize();
-    
-    // Apply the best solution
-    model = bestSolution;
-    
-    // Final validation
-    bool valid = validateSolution(model);
-    
-    if (!valid) {
-        std::cerr << "Warning: Final solution has constraints violations" << std::endl;
+        // Update temperature
+        temperature *= coolingRate;
+        
+        if (!improved) {
+            noImprovementCount++;
+        }
     }
     
-    // Recalculate area
-    model.totalArea = PlacementPacker::calculateTotalArea(
-        model.allModules, model.solutionWidth, model.solutionHeight);
+    std::cout << "Annealing complete - " << iterations << " iterations" << std::endl;
     
-    std::cout << "Final area: " << model.totalArea << std::endl;
+    // Restore best solution including tree structure
+    bstarTreeBackup = bestBStarTreeBackup;
+    restoreBStarTree();
+    restoreBestSolution();
     
-    return valid;
+    std::cout << "Final solution - Area: " << solutionArea << std::endl;
+    
+    return true;
 }
 
+// Get solution area
 int PlacementSolver::getSolutionArea() const {
-    return model.totalArea;
+    return solutionArea;
 }
 
-std::map<std::string, std::shared_ptr<Module>> PlacementSolver::getSolutionModules() const {
-    return model.allModules;
-}
-
-std::map<std::string, int> PlacementSolver::getStatistics() const {
-    std::map<std::string, int> stats;
-    stats["totalArea"] = model.totalArea;
-    stats["width"] = model.solutionWidth;
-    stats["height"] = model.solutionHeight;
-    stats["numModules"] = model.allModules.size();
-    stats["numSymmetryGroups"] = model.symmetryGroups.size();
-    stats["numRegularModules"] = model.regularModules.size();
-    return stats;
+// Get solution modules
+const std::map<std::string, std::shared_ptr<Module>>& PlacementSolver::getSolutionModules() const {
+    return bestSolutionModules;
 }

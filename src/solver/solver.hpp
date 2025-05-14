@@ -23,7 +23,7 @@
  * and local symmetry island optimization.
  */
 class PlacementSolver {
-private:
+public:
     // Problem data
     std::map<std::string, std::shared_ptr<Module>> modules;
     std::vector<std::shared_ptr<SymmetryGroup>> symmetryGroups;

@@ -11,6 +11,7 @@
 #include "data_struct/SymmetryConstraint.hpp"
 #include "data_struct/ASFBStarTree.hpp"
 #include "data_struct/SymmetryIslandBlock.hpp"
+#include "Logger.hpp"
 
 void printUsage(const char* programName) {
     std::cout << "Usage: " << programName << " <input_file> <output_file> [area_ratio]" << std::endl;
@@ -143,6 +144,8 @@ int main(int argc, char* argv[]) {
     solver.setTimeLimit(290);
     
     // Solve the placement problem
+    Logger::init("placement_debug.log");
+    Logger::log("Starting analog placement solver");
     std::cout << "Solving placement problem..." << std::endl;
     if (!solver.solve()) {
         std::cerr << "Error solving placement problem" << std::endl;

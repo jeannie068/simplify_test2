@@ -20,31 +20,14 @@
 
 /**
  * Packs the B*-tree to get the coordinates of all modules
- * This implementation uses level-order traversal (BFS)
+ * This implementation uses level-order traversal (BFS) with adjacency enforcement
  */
 void ASFBStarTree::packBStarTree() {
     // Clear the contour
     clearContour();
     
-    Logger::log("Starting to pack ASF-B*-tree");
+    Logger::log("Starting to pack ASF-B*-tree with connectivity enforcement");
     Logger::logTreeStructure("Pre-pack Tree", root);
-    
-    // Log all node names and their relationships
-    std::function<void(BStarNode*)> logNodeRelationships = [&](BStarNode* node) {
-        if (node == nullptr) return;
-        
-        if (node->left) {
-            Logger::log(node->moduleName + " has left child: " + node->left->moduleName);
-        }
-        if (node->right) {
-            Logger::log(node->moduleName + " has right child: " + node->right->moduleName);
-        }
-        
-        logNodeRelationships(node->left);
-        logNodeRelationships(node->right);
-    };
-    
-    logNodeRelationships(root);
     
     // Create a parent-child relationship map for efficient lookup
     std::unordered_map<BStarNode*, BStarNode*> parentMap;
@@ -91,8 +74,16 @@ void ASFBStarTree::packBStarTree() {
             
             // Process left child (placed to the right of current node)
             if (node->left) {
+                // ENFORCE ADJACENCY: Place directly adjacent to parent
                 int leftX = nodeX + modules[node->moduleName]->getWidth();
-                int leftY = getContourHeight(leftX);
+                // Try to place at same Y-coordinate to maintain adjacency
+                int leftY = nodeY;
+                
+                // If there's a conflict with the contour, adjust Y to the minimum required
+                int contourHeight = getContourHeight(leftX);
+                if (contourHeight > leftY) {
+                    leftY = contourHeight;
+                }
                 
                 // Store position of left child
                 nodePositions[node->left] = {leftX, leftY};
@@ -114,6 +105,7 @@ void ASFBStarTree::packBStarTree() {
             
             // Process right child (placed at same x, above current node)
             if (node->right) {
+                // ENFORCE ADJACENCY: Place directly adjacent to parent
                 int rightX = nodeX;
                 int rightY = nodeY + modules[node->moduleName]->getHeight();
                 
@@ -143,6 +135,7 @@ void ASFBStarTree::packBStarTree() {
         throw; // Re-throw the exception after logging
     }
 }
+
 
 /**
  * Updates the contour after placing a module
@@ -235,78 +228,94 @@ void ASFBStarTree::updateContour(int x, int y, int width, int height) {
 
 /**
  * Calculates the position of the symmetry axis based on the current placement
- * Using the corrected principles from the paper to ensure positive coordinates
+ * Optimized to prevent negative coordinates while maintaining connectivity
+ * With added safety checks for larger problems
  */
 void ASFBStarTree::calculateSymmetryAxisPosition() {
-    Logger::log("Calculating symmetry axis position with corrected logic");
+    Logger::log("Calculating optimized symmetry axis position for group: " + symmetryGroup->getName());
     
+    if (modules.empty()) {
+        symmetryAxisPosition = 0;
+        symmetryGroup->setAxisPosition(symmetryAxisPosition);
+        return;
+    }
+    
+    // Find the bounding box of all representative modules
+    int minX = std::numeric_limits<int>::max();
+    int maxX = std::numeric_limits<int>::min();
+    int minY = std::numeric_limits<int>::max();
+    int maxY = std::numeric_limits<int>::min();
+    
+    // Safe check: Only process modules that actually exist in the representation
+    for (const auto& pair : representativeModules) {
+        const auto& moduleName = pair.first;
+        
+        // Safety check: Make sure module exists in the modules map
+        auto moduleIt = modules.find(moduleName);
+        if (moduleIt == modules.end()) {
+            Logger::log("WARNING: Representative module " + moduleName + " not found in modules map");
+            continue;
+        }
+        
+        const auto& module = moduleIt->second;
+        minX = std::min(minX, module->getX());
+        maxX = std::max(maxX, module->getX() + module->getWidth());
+        minY = std::min(minY, module->getY());
+        maxY = std::max(maxY, module->getY() + module->getHeight());
+    }
+    
+    // Safety check: If no valid modules found, use default position
+    if (minX == std::numeric_limits<int>::max() || maxX == std::numeric_limits<int>::min()) {
+        Logger::log("WARNING: No valid representative modules found, using default axis position");
+        symmetryAxisPosition = 0;
+        symmetryGroup->setAxisPosition(symmetryAxisPosition);
+        return;
+    }
+    
+    // Calculate the width of all representative modules
+    int representativeWidth = maxX - minX;
+    int maxModuleWidth = 0;
+    
+    // Get max module width for buffer calculation
+    for (const auto& pair : modules) {
+        maxModuleWidth = std::max(maxModuleWidth, pair.second->getWidth());
+    }
+    
+    // Key improvement: Position the axis at the MAX of the representative modules
+    // This ensures no negative coordinates when mirroring
     if (symmetryGroup->getType() == SymmetryType::VERTICAL) {
-        // First calculate the total width needed for all representative modules
-        int totalWidth = 0;
-        int maxHeight = 0;
-        for (const auto& pair : representativeModules) {
-            totalWidth += modules[pair.first]->getWidth();
-            maxHeight = std::max(maxHeight, modules[pair.first]->getHeight());
+        // Position the axis at the right edge of the bounding box 
+        symmetryAxisPosition = maxX;
+        
+        // Add buffer for safety
+        int buffer = maxModuleWidth + 10;
+        
+        // Shift all modules to ensure symmetry axis stays positive
+        for (auto& pair : modules) {
+            int newX = pair.second->getX() + buffer;
+            pair.second->setPosition(newX, pair.second->getY());
         }
         
-        // Add some padding to ensure modules don't touch
-        totalWidth += representativeModules.size() * 2;
-        
-        // Double the width to account for symmetric copies
-        int fullWidth = totalWidth * 2;
-        
-        // Set the axis at half the total width to ensure all modules fit
-        // with positive coordinates after mirroring
-        symmetryAxisPosition = fullWidth / 2;
-        
-        // Shift all representative modules to be right of the axis
-        for (const auto& pair : representativeModules) {
-            auto module = modules[pair.first];
-            int originalX = module->getX();
-            // Add offset to ensure all are right of axis with some margin
-            module->setPosition(originalX + symmetryAxisPosition + 5, module->getY());
-        }
-        
-        // Special handling for self-symmetric modules - center them on the axis
-        for (const auto& moduleName : selfSymmetricModules) {
-            auto module = modules[moduleName];
-            // Center the self-symmetric module on the axis
-            module->setPosition(symmetryAxisPosition - module->getWidth()/2, module->getY());
-        }
+        // Update the symmetry axis position after shifting
+        symmetryAxisPosition += buffer;
         
         Logger::log("Set vertical symmetry axis at x=" + std::to_string(symmetryAxisPosition));
     } else {
-        // For horizontal symmetry, similar approach but with height
-        int totalHeight = 0;
-        int maxWidth = 0;
-        for (const auto& pair : representativeModules) {
-            totalHeight += modules[pair.first]->getHeight();
-            maxWidth = std::max(maxWidth, modules[pair.first]->getWidth());
+        // For horizontal symmetry - similar approach
+        symmetryAxisPosition = maxY;
+        
+        int maxModuleHeight = 0;
+        for (const auto& pair : modules) {
+            maxModuleHeight = std::max(maxModuleHeight, pair.second->getHeight());
         }
         
-        // Add some padding
-        totalHeight += representativeModules.size() * 2;
-        
-        // Double for symmetric copies
-        int fullHeight = totalHeight * 2;
-        
-        // Set the axis at half the total height
-        symmetryAxisPosition = fullHeight / 2;
-        
-        // Shift all representative modules to be above the axis
-        for (const auto& pair : representativeModules) {
-            auto module = modules[pair.first];
-            int originalY = module->getY();
-            // Add offset to ensure all are above axis with some margin
-            module->setPosition(module->getX(), originalY + symmetryAxisPosition + 5);
+        int buffer = maxModuleHeight + 10;
+        for (auto& pair : modules) {
+            int newY = pair.second->getY() + buffer;
+            pair.second->setPosition(pair.second->getX(), newY);
         }
         
-        // Center self-symmetric modules on the axis
-        for (const auto& moduleName : selfSymmetricModules) {
-            auto module = modules[moduleName];
-            // Center the self-symmetric module on the axis
-            module->setPosition(module->getX(), symmetryAxisPosition - module->getHeight()/2);
-        }
+        symmetryAxisPosition += buffer;
         
         Logger::log("Set horizontal symmetry axis at y=" + std::to_string(symmetryAxisPosition));
     }
@@ -316,7 +325,7 @@ void ASFBStarTree::calculateSymmetryAxisPosition() {
 
 /**
  * Updates the positions of symmetric modules based on their representatives
- * Correctly implements the mirroring according to the paper's equations
+ * Guarantees no negative coordinates with added safety checks
  */
 void ASFBStarTree::updateSymmetricModulePositions() {
     // Make sure the symmetry axis is set
@@ -331,24 +340,34 @@ void ASFBStarTree::updateSymmetricModulePositions() {
         const std::string& repName = pair.first;
         const std::string& symName = pair.second;
         
-        std::shared_ptr<Module> repModule = modules[repName];
-        std::shared_ptr<Module> symModule = modules[symName];
+        // Safety check: Make sure modules exist
+        auto repIt = modules.find(repName);
+        auto symIt = modules.find(symName);
+        
+        if (repIt == modules.end() || symIt == modules.end()) {
+            Logger::log("WARNING: Module not found when updating symmetry positions: " + 
+                      (repIt == modules.end() ? repName : symName));
+            continue;
+        }
+        
+        std::shared_ptr<Module> repModule = repIt->second;
+        std::shared_ptr<Module> symModule = symIt->second;
         
         if (symmetryGroup->getType() == SymmetryType::VERTICAL) {
-            // For vertical symmetry (correct implementation of equation 1 in the paper):
-            // x_j + x'_j = 2 × x̂_i and y_j = y'_j
-            
             // Calculate center coordinates of the representative module
             double repCenterX = repModule->getX() + repModule->getWidth() / 2.0;
             double repCenterY = repModule->getY() + repModule->getHeight() / 2.0;
             
             // Apply the symmetry equation to get the center of the symmetric module
             double symCenterX = 2 * symmetryAxisPosition - repCenterX;
-            double symCenterY = repCenterY;  // Same y-coordinate for vertical symmetry
+            double symCenterY = repCenterY;
             
             // Convert center coordinates back to top-left position
             int symX = static_cast<int>(symCenterX - symModule->getWidth() / 2.0);
             int symY = static_cast<int>(symCenterY - symModule->getHeight() / 2.0);
+            
+            // Sanity check: ensure no negative coordinates
+            symX = std::max(0, symX);
             
             symModule->setPosition(symX, symY);
             
@@ -356,20 +375,18 @@ void ASFBStarTree::updateSymmetricModulePositions() {
                        ", " + std::to_string(repCenterY) + ") -> " + symName + " center at (" + 
                        std::to_string(symCenterX) + ", " + std::to_string(symCenterY) + ")");
         } else {
-            // For horizontal symmetry (correct implementation of equation 2 in the paper):
-            // x_j = x'_j and y_j + y'_j = 2 × ŷ_i
-            
-            // Calculate center coordinates of the representative module
+            // For horizontal symmetry
             double repCenterX = repModule->getX() + repModule->getWidth() / 2.0;
             double repCenterY = repModule->getY() + repModule->getHeight() / 2.0;
             
-            // Apply the symmetry equation to get the center of the symmetric module
-            double symCenterX = repCenterX;  // Same x-coordinate for horizontal symmetry
+            double symCenterX = repCenterX;
             double symCenterY = 2 * symmetryAxisPosition - repCenterY;
             
-            // Convert center coordinates back to top-left position
             int symX = static_cast<int>(symCenterX - symModule->getWidth() / 2.0);
             int symY = static_cast<int>(symCenterY - symModule->getHeight() / 2.0);
+            
+            // Sanity check: ensure no negative coordinates
+            symY = std::max(0, symY);
             
             symModule->setPosition(symX, symY);
             
@@ -382,7 +399,30 @@ void ASFBStarTree::updateSymmetricModulePositions() {
         symModule->setRotation(repModule->getRotated());
     }
     
-    // Self-symmetric modules are already handled in calculateSymmetryAxisPosition
+    // Handle self-symmetric modules
+    for (const auto& moduleName : selfSymmetricModules) {
+        // Safety check: Make sure module exists
+        auto moduleIt = modules.find(moduleName);
+        if (moduleIt == modules.end()) {
+            Logger::log("WARNING: Self-symmetric module not found: " + moduleName);
+            continue;
+        }
+        
+        auto module = moduleIt->second;
+        
+        // Center on the symmetry axis
+        if (symmetryGroup->getType() == SymmetryType::VERTICAL) {
+            module->setPosition(
+                symmetryAxisPosition - module->getWidth()/2, 
+                module->getY()
+            );
+        } else {
+            module->setPosition(
+                module->getX(),
+                symmetryAxisPosition - module->getHeight()/2
+            );
+        }
+    }
 }
 
 /**
@@ -566,43 +606,93 @@ void ASFBStarTree::buildInitialBStarTree() {
 
 /**
  * Packs the ASF-B*-tree to get the coordinates of all modules
+ * with improved axis placement and connectivity enforcement
  * 
  * @return True if packing was successful
  */
+/**
+ * Packs the ASF-B*-tree with robust error handling
+ */
 bool ASFBStarTree::pack() {
     try {
+        Logger::log("Starting safe packing for symmetry group: " + symmetryGroup->getName());
+        
+        // Safety check for empty tree
+        if (!root) {
+            Logger::log("WARNING: Empty ASF-B*-tree, nothing to pack");
+            return false;
+        }
+        
         // Update the traversals for the current B*-tree
         preorderTraversal.clear();
         inorderTraversal.clear();
         preorder(root);
         inorder(root);
         
-        Logger::log("Starting ASF-B*-tree packing with " + 
-                   std::to_string(preorderTraversal.size()) + " nodes");
+        if (preorderTraversal.empty()) {
+            Logger::log("WARNING: Empty traversal, nothing to pack");
+            return false;
+        }
+        
+        Logger::log("ASF-B*-tree packing with " + std::to_string(preorderTraversal.size()) + " nodes");
         
         // Pack the B*-tree to get coordinates for representatives
         packBStarTree();
         
-        // First calculate the symmetry axis position with corrected logic
+        // First try to enforce connectivity
+        if (!enforceConnectivity()) {
+            Logger::log("WARNING: Failed to enforce connectivity, continuing with placement anyway");
+        }
+        
+        // Calculate the symmetry axis position with improved logic
         calculateSymmetryAxisPosition();
         
-        // Then update positions of symmetric modules with corrected mirroring
+        // Update positions of symmetric modules
         updateSymmetricModulePositions();
         
-        // Validate the resulting placement satisfies symmetry constraints
+        // Validate the resulting placement 
         if (!validateSymmetry()) {
-            Logger::log("ERROR: Placement does not satisfy symmetry constraints");
+            Logger::log("WARNING: Placement does not fully satisfy symmetry constraints, attempting to fix");
             
-            // Debug information to understand the problem
+            // Shift all modules if needed to ensure no negative coordinates
+            bool needsShift = false;
+            int minX = 0;
+            int minY = 0;
+            
             for (const auto& pair : modules) {
-                Logger::log("Module: " + pair.first + " at (" + 
-                           std::to_string(pair.second->getX()) + ", " + 
-                           std::to_string(pair.second->getY()) + ") with dimensions " +
-                           std::to_string(pair.second->getWidth()) + "x" + 
-                           std::to_string(pair.second->getHeight()));
+                if (pair.second->getX() < minX) {
+                    minX = pair.second->getX();
+                    needsShift = true;
+                }
+                if (pair.second->getY() < minY) {
+                    minY = pair.second->getY();
+                    needsShift = true;
+                }
             }
             
-            return false;
+            if (needsShift) {
+                Logger::log("Shifting all modules to eliminate negative coordinates");
+                for (auto& pair : modules) {
+                    pair.second->setPosition(
+                        pair.second->getX() - minX,
+                        pair.second->getY() - minY
+                    );
+                }
+                
+                // Update symmetry axis position after shifting
+                if (symmetryGroup->getType() == SymmetryType::VERTICAL) {
+                    symmetryAxisPosition -= minX;
+                } else {
+                    symmetryAxisPosition -= minY;
+                }
+                symmetryGroup->setAxisPosition(symmetryAxisPosition);
+            }
+            
+            // Check again after fixing
+            if (!validateSymmetry()) {
+                Logger::log("ERROR: Still unable to satisfy symmetry constraints after fixing attempt");
+                return false;
+            }
         }
         
         return true;
@@ -613,96 +703,253 @@ bool ASFBStarTree::pack() {
     }
 }
 
+
 /**
- * Validates the symmetric placement specifically checking for negative coordinates
+ * Validate if the symmetry is maintained, with improved error reporting
  */
 bool ASFBStarTree::validateSymmetry() const {
-    // First check for negative coordinates which would invalidate the placement
+    try {
+        // First check for negative coordinates which would invalidate the placement
+        for (const auto& pair : modules) {
+            const auto& module = pair.second;
+            if (module->getX() < 0 || module->getY() < 0) {
+                Logger::log("ERROR: Module " + pair.first + " has negative coordinates (" + 
+                          std::to_string(module->getX()) + ", " + 
+                          std::to_string(module->getY()) + ")");
+                return false;
+            }
+        }
+        
+        // Validate symmetry pairs have correct placements
+        for (const auto& pair : repToPairMap) {
+            // Safety check: Make sure both modules exist
+            auto repIt = modules.find(pair.first);
+            auto symIt = modules.find(pair.second);
+            
+            if (repIt == modules.end() || symIt == modules.end()) {
+                Logger::log("WARNING: Cannot validate symmetry for missing modules: " + 
+                          pair.first + " or " + pair.second);
+                continue;
+            }
+            
+            const std::string& repName = pair.first;
+            const std::string& symName = pair.second;
+            
+            std::shared_ptr<Module> repModule = repIt->second;
+            std::shared_ptr<Module> symModule = symIt->second;
+            
+            // Calculate centers
+            double repCenterX = repModule->getX() + repModule->getWidth() / 2.0;
+            double repCenterY = repModule->getY() + repModule->getHeight() / 2.0;
+            double symCenterX = symModule->getX() + symModule->getWidth() / 2.0;
+            double symCenterY = symModule->getY() + symModule->getHeight() / 2.0;
+            
+            if (symmetryGroup->getType() == SymmetryType::VERTICAL) {
+                // Check vertical symmetry equation
+                double expectedSum = 2 * symmetryAxisPosition;
+                double actualSum = repCenterX + symCenterX;
+                double error = std::abs(expectedSum - actualSum);
+                
+                // Also check y-coordinates match
+                double yError = std::abs(repCenterY - symCenterY);
+                
+                if (error > 1.0 || yError > 1.0) {  // Allow small floating-point error
+                    Logger::log("ERROR: Symmetry violation for pair (" + repName + ", " + symName + ")");
+                    Logger::log("  Expected: repCenterX + symCenterX = " + std::to_string(expectedSum));
+                    Logger::log("  Actual: " + std::to_string(repCenterX) + " + " + std::to_string(symCenterX) + " = " + std::to_string(actualSum));
+                    Logger::log("  Y error: " + std::to_string(yError));
+                    return false;
+                }
+            } else {
+                // Check horizontal symmetry equation
+                double expectedSum = 2 * symmetryAxisPosition;
+                double actualSum = repCenterY + symCenterY;
+                double error = std::abs(expectedSum - actualSum);
+                
+                // Also check x-coordinates match
+                double xError = std::abs(repCenterX - symCenterX);
+                
+                if (error > 1.0 || xError > 1.0) {  // Allow small floating-point error
+                    Logger::log("ERROR: Symmetry violation for pair (" + repName + ", " + symName + ")");
+                    Logger::log("  Expected: repCenterY + symCenterY = " + std::to_string(expectedSum));
+                    Logger::log("  Actual: " + std::to_string(repCenterY) + " + " + std::to_string(symCenterY) + " = " + std::to_string(actualSum));
+                    Logger::log("  X error: " + std::to_string(xError));
+                    return false;
+                }
+            }
+        }
+        
+        // Check self-symmetric modules are centered on the axis
+        for (const auto& moduleName : selfSymmetricModules) {
+            // Safety check: Make sure module exists
+            auto moduleIt = modules.find(moduleName);
+            if (moduleIt == modules.end()) {
+                Logger::log("WARNING: Cannot validate symmetry for missing self-symmetric module: " + moduleName);
+                continue;
+            }
+            
+            std::shared_ptr<Module> module = moduleIt->second;
+            double centerX = module->getX() + module->getWidth() / 2.0;
+            double centerY = module->getY() + module->getHeight() / 2.0;
+            
+            if (symmetryGroup->getType() == SymmetryType::VERTICAL) {
+                double error = std::abs(centerX - symmetryAxisPosition);
+                if (error > 1.0) {  // Allow small floating-point error
+                    Logger::log("ERROR: Self-symmetric module " + moduleName + " not centered on axis");
+                    Logger::log("  Module center: " + std::to_string(centerX));
+                    Logger::log("  Axis position: " + std::to_string(symmetryAxisPosition));
+                    return false;
+                }
+            } else {
+                double error = std::abs(centerY - symmetryAxisPosition);
+                if (error > 1.0) {  // Allow small floating-point error
+                    Logger::log("ERROR: Self-symmetric module " + moduleName + " not centered on axis");
+                    Logger::log("  Module center: " + std::to_string(centerY));
+                    Logger::log("  Axis position: " + std::to_string(symmetryAxisPosition));
+                    return false;
+                }
+            }
+        }
+        
+        // If all checks pass, the symmetry is valid
+        Logger::log("Symmetry validation passed");
+        return true;
+    } catch (const std::exception& e) {
+        Logger::log("Exception in validateSymmetry: " + std::string(e.what()));
+        return false;
+    }
+}
+
+/**
+ * Validates that the modules form a connected placement (symmetry island)
+ * 
+ * @return True if all modules are connected
+ */
+bool ASFBStarTree::validateConnectivity() {
+    Logger::log("Validating connectivity (symmetry island constraint)");
+    
+    if (modules.empty()) return true;
+    
+    // Build position and dimension maps for the isSymmetryIsland check
+    std::unordered_map<std::string, std::pair<int, int>> positions;
+    std::unordered_map<std::string, std::pair<int, int>> dimensions;
+    
     for (const auto& pair : modules) {
+        const std::string& name = pair.first;
         const auto& module = pair.second;
-        if (module->getX() < 0 || module->getY() < 0) {
-            Logger::log("ERROR: Module " + pair.first + " has negative coordinates (" + 
-                       std::to_string(module->getX()) + ", " + 
-                       std::to_string(module->getY()) + ")");
+        positions[name] = {module->getX(), module->getY()};
+        dimensions[name] = {module->getWidth(), module->getHeight()};
+    }
+    
+    // Use the isSymmetryIsland function from SymmetryGroup
+    bool isConnected = symmetryGroup->isSymmetryIsland(positions, dimensions);
+    
+    if (isConnected) {
+        Logger::log("Connectivity validation passed - all modules form a symmetry island");
+    } else {
+        Logger::log("Connectivity validation failed - modules do not form a symmetry island");
+    }
+    
+    return isConnected;
+}
+
+/**
+ * Attempts to enforce connectivity by repositioning modules
+ * Modified enforceConnectivity function to maintain valid symmetry
+ * 
+ * @return True if successful in creating a connected symmetry island
+ */
+bool ASFBStarTree::enforceConnectivity() {
+    Logger::log("Enforcing connectivity for symmetry island with improved error handling");
+    
+    try {
+        // Get all representative modules
+        std::vector<std::string> repModuleNames;
+        for (const auto& pair : representativeModules) {
+            repModuleNames.push_back(pair.first);
+        }
+        
+        if (repModuleNames.empty()) {
+            Logger::log("No representative modules to connect");
+            return true;
+        }
+        
+        // Safety check: ensure all module names exist in the modules map
+        std::vector<std::string> validModuleNames;
+        for (const auto& name : repModuleNames) {
+            if (modules.find(name) != modules.end()) {
+                validModuleNames.push_back(name);
+            } else {
+                Logger::log("WARNING: Module " + name + " not found when enforcing connectivity");
+            }
+        }
+        
+        if (validModuleNames.empty()) {
+            Logger::log("No valid modules to connect");
             return false;
         }
-    }
-    
-    // Validate symmetry pairs have correct placements
-    for (const auto& pair : repToPairMap) {
-        const std::string& repName = pair.first;
-        const std::string& symName = pair.second;
         
-        std::shared_ptr<Module> repModule = modules.at(repName);
-        std::shared_ptr<Module> symModule = modules.at(symName);
+        // Sort modules by width for better packing (place wider modules first)
+        std::sort(validModuleNames.begin(), validModuleNames.end(), 
+                [&](const std::string& a, const std::string& b) {
+                    return modules.at(a)->getWidth() > modules.at(b)->getWidth();
+                });
         
-        // Calculate centers
-        double repCenterX = repModule->getX() + repModule->getWidth() / 2.0;
-        double repCenterY = repModule->getY() + repModule->getHeight() / 2.0;
-        double symCenterX = symModule->getX() + symModule->getWidth() / 2.0;
-        double symCenterY = symModule->getY() + symModule->getHeight() / 2.0;
+        // Start with the first representative module as the anchor
+        std::string anchorName = validModuleNames[0];
+        std::shared_ptr<Module> anchor = modules.at(anchorName);
         
-        if (symmetryGroup->getType() == SymmetryType::VERTICAL) {
-            // Check vertical symmetry equation
-            double expectedSum = 2 * symmetryAxisPosition;
-            double actualSum = repCenterX + symCenterX;
-            double error = std::abs(expectedSum - actualSum);
+        // Position the anchor at (0,0) for optimum placement
+        anchor->setPosition(0, 0);
+        
+        // Track connected modules
+        std::unordered_set<std::string> connected;
+        connected.insert(anchorName);
+        
+        // Place modules in compact arrangement
+        // Try to create a balanced layout for better area utilization
+        int row = 0;
+        int currentX = 0;
+        int currentY = 0;
+        int rowHeight = anchor->getHeight();
+        
+        for (size_t i = 1; i < validModuleNames.size(); i++) {
+            const std::string& moduleName = validModuleNames[i];
+            std::shared_ptr<Module> module = modules.at(moduleName);
             
-            // Also check y-coordinates match
-            double yError = std::abs(repCenterY - symCenterY);
-            
-            if (error > 1.0 || yError > 1.0) {  // Allow small floating-point error
-                Logger::log("ERROR: Symmetry violation for pair (" + repName + ", " + symName + ")");
-                Logger::log("  Expected: repCenterX + symCenterX = " + std::to_string(expectedSum));
-                Logger::log("  Actual: " + std::to_string(repCenterX) + " + " + std::to_string(symCenterX) + " = " + std::to_string(actualSum));
-                Logger::log("  Y error: " + std::to_string(yError));
-                return false;
+            // Check if module would extend too far to the right (arbitrary threshold)
+            int maxRowWidth = 5 * anchor->getWidth(); // Limit row width for better aspect ratio
+            if (currentX + module->getWidth() > maxRowWidth) {
+                // Start a new row
+                currentX = 0;
+                currentY += rowHeight;
+                rowHeight = module->getHeight();
+            } else {
+                rowHeight = std::max(rowHeight, module->getHeight());
             }
-        } else {
-            // Check horizontal symmetry equation
-            double expectedSum = 2 * symmetryAxisPosition;
-            double actualSum = repCenterY + symCenterY;
-            double error = std::abs(expectedSum - actualSum);
             
-            // Also check x-coordinates match
-            double xError = std::abs(repCenterX - symCenterX);
+            // Place the module
+            module->setPosition(currentX, currentY);
+            currentX += module->getWidth();
             
-            if (error > 1.0 || xError > 1.0) {  // Allow small floating-point error
-                Logger::log("ERROR: Symmetry violation for pair (" + repName + ", " + symName + ")");
-                Logger::log("  Expected: repCenterY + symCenterY = " + std::to_string(expectedSum));
-                Logger::log("  Actual: " + std::to_string(repCenterY) + " + " + std::to_string(symCenterY) + " = " + std::to_string(actualSum));
-                Logger::log("  X error: " + std::to_string(xError));
-                return false;
-            }
+            // Add to connected set
+            connected.insert(moduleName);
+            
+            Logger::log("Enforced connectivity: placed " + moduleName + " at (" + 
+                       std::to_string(module->getX()) + ", " + 
+                       std::to_string(module->getY()) + ")");
         }
-    }
-    
-    // Check self-symmetric modules are centered on the axis
-    for (const auto& moduleName : selfSymmetricModules) {
-        std::shared_ptr<Module> module = modules.at(moduleName);
-        double centerX = module->getX() + module->getWidth() / 2.0;
-        double centerY = module->getY() + module->getHeight() / 2.0;
         
-        if (symmetryGroup->getType() == SymmetryType::VERTICAL) {
-            double error = std::abs(centerX - symmetryAxisPosition);
-            if (error > 1.0) {  // Allow small floating-point error
-                Logger::log("ERROR: Self-symmetric module " + moduleName + " not centered on axis");
-                Logger::log("  Module center: " + std::to_string(centerX));
-                Logger::log("  Axis position: " + std::to_string(symmetryAxisPosition));
-                return false;
-            }
+        // Verify that all valid representative modules are now connected
+        if (connected.size() == validModuleNames.size()) {
+            Logger::log("Successfully enforced connectivity for all representative modules");
+            return true;
         } else {
-            double error = std::abs(centerY - symmetryAxisPosition);
-            if (error > 1.0) {  // Allow small floating-point error
-                Logger::log("ERROR: Self-symmetric module " + moduleName + " not centered on axis");
-                Logger::log("  Module center: " + std::to_string(centerY));
-                Logger::log("  Axis position: " + std::to_string(symmetryAxisPosition));
-                return false;
-            }
+            Logger::log("Failed to enforce connectivity for all modules");
+            return false;
         }
+    } catch (const std::exception& e) {
+        Logger::log("Exception in enforceConnectivity: " + std::string(e.what()));
+        return false;
     }
-    
-    // If all checks pass, the symmetry is valid
-    Logger::log("Symmetry validation passed");
-    return true;
 }

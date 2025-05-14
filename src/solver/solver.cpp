@@ -825,38 +825,87 @@ void PlacementSolver::restoreBStarTree() {
 
 // Check for module overlaps
 bool PlacementSolver::hasOverlaps() {
-    // Check overlaps between regular modules
-    for (const auto& pair1 : regularModules) {
-        const auto& module1 = pair1.second;
+    try {
+        // Debug logging
+        Logger::log("Checking for module overlaps");
         
-        // Check against other regular modules
-        for (const auto& pair2 : regularModules) {
-            if (pair1.first == pair2.first) continue; // Skip self
+        // Check overlaps between regular modules
+        for (const auto& pair1 : regularModules) {
+            const auto& name1 = pair1.first;
+            const auto& module1 = pair1.second;
             
-            const auto& module2 = pair2.second;
-            if (module1->overlaps(*module2)) {
-                return true;
+            // Debug bounds
+            int m1Left = module1->getX();
+            int m1Right = m1Left + module1->getWidth();
+            int m1Bottom = module1->getY();
+            int m1Top = m1Bottom + module1->getHeight();
+            
+            // Check against other regular modules
+            for (const auto& pair2 : regularModules) {
+                const auto& name2 = pair2.first;
+                if (name1 == name2) continue; // Skip self
+                
+                const auto& module2 = pair2.second;
+                
+                if (module1->overlaps(*module2)) {
+                    Logger::log("Overlap detected between regular modules: " + 
+                               name1 + " and " + name2);
+                    return true;
+                }
+            }
+            
+            // Check against symmetry islands
+            for (const auto& island : symmetryIslands) {
+                // Extract island bounds
+                int islandLeft = island->getX();
+                int islandRight = islandLeft + island->getWidth();
+                int islandBottom = island->getY();
+                int islandTop = islandBottom + island->getHeight();
+                
+                // Quick overlap check
+                bool overlap = !(m1Right <= islandLeft || islandRight <= m1Left ||
+                               m1Top <= islandBottom || islandTop <= m1Bottom);
+                
+                if (overlap) {
+                    Logger::log("Overlap detected between module " + name1 + 
+                               " and symmetry island " + island->getName());
+                    return true;
+                }
             }
         }
         
-        // Check against symmetry islands
-        for (const auto& island : symmetryIslands) {
-            if (island->overlaps(*module1)) {
-                return true;
+        // Check overlaps between symmetry islands
+        for (size_t i = 0; i < symmetryIslands.size(); i++) {
+            for (size_t j = i + 1; j < symmetryIslands.size(); j++) {
+                // Extract island bounds
+                int island1Left = symmetryIslands[i]->getX();
+                int island1Right = island1Left + symmetryIslands[i]->getWidth();
+                int island1Bottom = symmetryIslands[i]->getY();
+                int island1Top = island1Bottom + symmetryIslands[i]->getHeight();
+                
+                int island2Left = symmetryIslands[j]->getX();
+                int island2Right = island2Left + symmetryIslands[j]->getWidth();
+                int island2Bottom = symmetryIslands[j]->getY();
+                int island2Top = island2Bottom + symmetryIslands[j]->getHeight();
+                
+                // Quick overlap check
+                bool overlap = !(island1Right <= island2Left || island2Right <= island1Left ||
+                               island1Top <= island2Bottom || island2Top <= island1Bottom);
+                
+                if (overlap) {
+                    Logger::log("Overlap detected between symmetry islands " + 
+                               symmetryIslands[i]->getName() + " and " + 
+                               symmetryIslands[j]->getName());
+                    return true;
+                }
             }
         }
+        
+        return false;
+    } catch (const std::exception& e) {
+        Logger::log("Exception in hasOverlaps: " + std::string(e.what()));
+        return true; // Assume overlap on error to be safe
     }
-    
-    // Check overlaps between symmetry islands
-    for (size_t i = 0; i < symmetryIslands.size(); i++) {
-        for (size_t j = i + 1; j < symmetryIslands.size(); j++) {
-            if (symmetryIslands[i]->overlaps(*symmetryIslands[j])) {
-                return true;
-            }
-        }
-    }
-    
-    return false;
 }
 
 // Deep copy of module data

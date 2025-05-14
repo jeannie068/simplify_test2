@@ -313,6 +313,13 @@ public:
     bool isSelfSymmetric(const std::string& moduleName) const {
         return std::find(selfSymmetricModules.begin(), selfSymmetricModules.end(), moduleName) != selfSymmetricModules.end();
     }
+
+    /**
+     * Checks if a module is a representative (not a symmetric module)
+     */
+    bool isRepresentative(const std::string& moduleName) const {
+        return representativeModules.find(moduleName) != representativeModules.end();
+    }
     
     /**
      * Performs a preorder traversal of the B*-tree
@@ -372,6 +379,10 @@ public:
     bool pack();
 
     bool validateSymmetry() const;
+
+    bool validateConnectivity();
+
+    bool enforceConnectivity();
 
     // Backup/restore methods for the tree structure
     void backupTreeStructure() {

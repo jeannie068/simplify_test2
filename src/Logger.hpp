@@ -62,7 +62,7 @@ public:
         logFile << timestamp.str() << " | " << indentation << message << std::endl;
         
         // Also print to console for immediate feedback
-        std::cout << "LOG: " << indentation << message << std::endl;
+        // std::cout << "LOG: " << indentation << message << std::endl;
     }
     
     // Specific logger for tree structures

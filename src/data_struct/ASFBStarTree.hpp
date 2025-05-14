@@ -48,9 +48,7 @@ private:
     void initializeContours();
     void updateContourWithModule(const shared_ptr<Module>& module);
     void packNode(const shared_ptr<BStarTreeNode>& node);
-    void calculateSymmetricModulePositions();
-    // New function to calculate the optimal symmetry axis position
-    void calculateSymmetryAxis();
+    
     
 public:
     /**
@@ -70,6 +68,10 @@ public:
     bool isOnCorrectBranch(const string& moduleName) const;
     bool isSymmetryIslandValid() const;
     bool isOnBoundary(const string& moduleName) const;
+
+    void calculateSymmetricModulePositions();
+    // New function to calculate the optimal symmetry axis position
+    void calculateSymmetryAxis();
     
     /**
      * Calculates the coordinates of all modules in the symmetry group

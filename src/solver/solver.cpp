@@ -8,6 +8,7 @@
 #include "solver.hpp"
 #include "../utils/PlacementPacker.hpp"
 #include "../utils/PlacementPerturber.hpp"
+#include "../data_struct/RestructuredBStarTree.hpp"
 #include <iostream>
 #include <ctime>
 #include <algorithm>
@@ -266,6 +267,13 @@ bool PlacementSolver::repairInitialSolution() {
     return anyResolved;
 }
 
+/**
+ * Resolves module overlap by updating both coordinates and tree structure
+ * 
+ * @param module1Name First module name
+ * @param module2Name Second module name
+ * @return True if overlap was resolved
+ */
 bool PlacementSolver::resolveModuleOverlap(const std::string& module1Name, const std::string& module2Name) {
     auto it1 = model.allModules.find(module1Name);
     auto it2 = model.allModules.find(module2Name);
@@ -339,88 +347,348 @@ bool PlacementSolver::resolveModuleOverlap(const std::string& module1Name, const
         // Check if this resolves the overlap
         if (!moduleToMove->overlaps(*otherModule)) {
             std::cout << "  Successfully resolved overlap!" << std::endl;
+            
+            // Now update the tree structure to reflect this new position
+            updateTreeStructureAfterMovement(moduleToMoveName);
+            
             return true;
         }
     }
     
-    // If we reach here, we couldn't resolve the overlap
-    // Restore original positions
-    module1->setPosition(origX1, origY1);
-    module2->setPosition(origX2, origY2);
-    
-    std::cout << "  Failed to resolve overlap, trying more aggressive strategies" << std::endl;
-    
-    // More aggressive strategy: place the module far away
+    // If we reach here, we couldn't resolve the overlap with small movements
+    // Try more aggressive strategy: place the module far away
     int farX = model.solutionWidth + moduleToMove->getWidth() * 2;
     int farY = model.solutionHeight + moduleToMove->getHeight() * 2;
     
     moduleToMove->setPosition(farX, farY);
     std::cout << "  Moved " << moduleToMoveName << " far away to (" << farX << ", " << farY << ")" << std::endl;
     
+    // Update the tree structure
+    updateTreeStructureAfterMovement(moduleToMoveName);
+    
     // This should definitely resolve the overlap
     return true;
 }
 
+/**
+ * Creates a global B*-tree for overall placement
+ * This improved implementation uses the restructured B*-tree approach
+ */
 void PlacementSolver::createGlobalBTree() {
-    // Clear existing tree
-    model.globalTree = nullptr;
-    model.globalNodes.clear();
+    // Create a new restructured B*-tree
+    RestructuredBStarTree restructuredTree;
     
     // Combine regular modules and symmetry islands
-    std::vector<std::pair<std::string, int>> allNodes;
+    std::map<std::string, int> moduleAreas;
     
     // Add regular modules
     for (const auto& pair : model.regularModules) {
         std::string nodeName = "reg_" + pair.first;
         model.globalNodes[nodeName] = pair.second;
-        allNodes.push_back({nodeName, pair.second->getArea()});
+        
+        // Calculate area for sorting
+        int area = pair.second->getWidth() * pair.second->getHeight();
+        moduleAreas[nodeName] = area;
     }
     
     // Add symmetry islands
     for (const auto& island : model.symmetryIslands) {
         std::string nodeName = "island_" + island->getName();
         model.globalNodes[nodeName] = island;
-        allNodes.push_back({nodeName, island->getArea()});
+        
+        // Calculate area for sorting
+        int area = island->getWidth() * island->getHeight();
+        moduleAreas[nodeName] = area;
     }
     
-    // Sort by area (largest first)
-    std::sort(allNodes.begin(), allNodes.end(),
-              [](const auto& a, const auto& b) {
-                  return a.second > b.second;
-              });
+    // Create an optimized tree structure based on module areas
+    restructuredTree.createOptimizedTree(moduleAreas);
     
-    // Create B*-tree in a balanced way
-    if (!allNodes.empty()) {
-        // Start with the root node (largest area)
-        model.globalTree = std::make_shared<BStarTreeNode>(allNodes[0].first);
+    // Convert the restructured tree to our B*-tree representation
+    model.globalTree = convertRestructuredTreeToGlobalTree(restructuredTree);
+    
+    // Now optimize the tree based on spatial relationships if we have initial positions
+    optimizeGlobalTreeStructure();
+}
+
+/**
+ * Converts a RestructuredBStarTree to our global tree representation
+ * 
+ * @param restructuredTree The restructured B*-tree
+ * @return Root node of the converted tree
+ */
+std::shared_ptr<BStarTreeNode> PlacementSolver::convertRestructuredTreeToGlobalTree(
+    const RestructuredBStarTree& restructuredTree) {
+    
+    // Get all nodes in preorder traversal
+    std::vector<std::shared_ptr<BStarTreeNode>> preorderNodes = 
+        restructuredTree.getAllNodesPreOrder();
+    
+    if (preorderNodes.empty()) {
+        return nullptr;
+    }
+    
+    // Create a map to track the converted nodes
+    std::unordered_map<std::string, std::shared_ptr<BStarTreeNode>> convertedNodes;
+    
+    // Create the root node
+    std::shared_ptr<BStarTreeNode> globalRoot = 
+        std::make_shared<BStarTreeNode>(preorderNodes[0]->getModuleName());
+    
+    convertedNodes[globalRoot->getModuleName()] = globalRoot;
+    
+    // Create all other nodes and set up parent-child relationships
+    for (size_t i = 1; i < preorderNodes.size(); i++) {
+        auto originalNode = preorderNodes[i];
+        auto newNode = std::make_shared<BStarTreeNode>(originalNode->getModuleName());
         
-        // Add other nodes level by level
-        for (size_t i = 1; i < allNodes.size(); ++i) {
-            // Find a suitable parent using BFS
-            std::queue<std::shared_ptr<BStarTreeNode>> queue;
-            queue.push(model.globalTree);
-            
-            while (!queue.empty()) {
-                auto current = queue.front();
-                queue.pop();
+        convertedNodes[newNode->getModuleName()] = newNode;
+        
+        // Find parent in original tree
+        std::shared_ptr<BStarTreeNode> originalParent = originalNode->getParent();
+        if (originalParent) {
+            auto it = convertedNodes.find(originalParent->getModuleName());
+            if (it != convertedNodes.end()) {
+                // Set parent-child relationship
+                auto convertedParent = it->second;
+                newNode->setParent(convertedParent);
                 
-                if (!current->getLeftChild()) {
-                    auto newNode = std::make_shared<BStarTreeNode>(allNodes[i].first);
-                    current->setLeftChild(newNode);
-                    newNode->setParent(current);
-                    break;
-                } else if (!current->getRightChild()) {
-                    auto newNode = std::make_shared<BStarTreeNode>(allNodes[i].first);
-                    current->setRightChild(newNode);
-                    newNode->setParent(current);
-                    break;
+                // Determine if left or right child
+                if (originalParent->getLeftChild() && 
+                    originalParent->getLeftChild()->getModuleName() == originalNode->getModuleName()) {
+                    convertedParent->setLeftChild(newNode);
                 } else {
-                    queue.push(current->getLeftChild());
-                    queue.push(current->getRightChild());
+                    convertedParent->setRightChild(newNode);
                 }
             }
         }
     }
+    
+    return globalRoot;
+}
+
+/**
+ * Optimizes the global tree structure based on spatial relationships
+ */
+void PlacementSolver::optimizeGlobalTreeStructure() {
+    // Create a map of node positions
+    std::map<std::string, std::pair<int, int>> nodePositions;
+    
+    // Get positions of regular modules
+    for (const auto& pair : model.globalNodes) {
+        std::visit([&](auto&& arg) {
+            using T = std::decay_t<decltype(arg)>;
+            if constexpr (std::is_same_v<T, std::shared_ptr<Module>>) {
+                nodePositions[pair.first] = {arg->getX(), arg->getY()};
+            } else if constexpr (std::is_same_v<T, std::shared_ptr<SymmetryIslandBlock>>) {
+                nodePositions[pair.first] = {arg->getX(), arg->getY()};
+            }
+        }, pair.second);
+    }
+    
+    // Create a restructured tree with these positions
+    RestructuredBStarTree newTree;
+    
+    // First add all nodes
+    std::vector<std::shared_ptr<BStarTreeNode>> preorderNodes;
+    collectGlobalNodesPreOrder(model.globalTree, preorderNodes);
+    
+    for (const auto& node : preorderNodes) {
+        auto newNode = std::make_shared<BStarTreeNode>(node->getModuleName());
+        newTree.addNode(newNode);
+    }
+    
+    // Then optimize based on positions
+    newTree.optimizeTreeFromPositions(nodePositions);
+    
+    // Replace the global tree with the optimized one
+    model.globalTree = convertRestructuredTreeToGlobalTree(newTree);
+}
+
+/**
+ * Collects nodes in the global tree in preorder traversal
+ * 
+ * @param node Current node
+ * @param nodes Output vector of nodes
+ */
+void PlacementSolver::collectGlobalNodesPreOrder(
+    const std::shared_ptr<BStarTreeNode>& node,
+    std::vector<std::shared_ptr<BStarTreeNode>>& nodes) {
+    
+    if (!node) return;
+    
+    // Root, Left, Right
+    nodes.push_back(node);
+    
+    if (node->getLeftChild()) {
+        collectGlobalNodesPreOrder(node->getLeftChild(), nodes);
+    }
+    
+    if (node->getRightChild()) {
+        collectGlobalNodesPreOrder(node->getRightChild(), nodes);
+    }
+}
+
+/**
+ * Rebuilds the global tree after a perturbation to maintain proper structure
+ */
+void PlacementSolver::rebuildGlobalTree() {
+    // Only rebuild if we have a tree
+    if (!model.globalTree) return;
+    
+    // Create a restructured tree from the current global tree
+    RestructuredBStarTree restructuredTree;
+    
+    // Collect all nodes
+    std::vector<std::shared_ptr<BStarTreeNode>> nodes;
+    collectGlobalNodesPreOrder(model.globalTree, nodes);
+    
+    for (const auto& node : nodes) {
+        auto newNode = std::make_shared<BStarTreeNode>(node->getModuleName());
+        restructuredTree.addNode(newNode);
+    }
+    
+    // Rebuild the tree
+    restructuredTree.rebuildTree();
+    
+    // Convert back to global tree
+    model.globalTree = convertRestructuredTreeToGlobalTree(restructuredTree);
+}
+
+
+/**
+ * Updates the tree structure after moving a module
+ * 
+ * @param moduleName Name of the moved module
+ */
+void PlacementSolver::updateTreeStructureAfterMovement(const std::string& moduleName) {
+    // Find the global node name for this module
+    std::string globalNodeName;
+    for (const auto& pair : model.globalNodes) {
+        bool matches = std::visit([&](auto&& arg) -> bool {
+            using T = std::decay_t<decltype(arg)>;
+            if constexpr (std::is_same_v<T, std::shared_ptr<Module>>) {
+                return arg->getName() == moduleName;
+            }
+            return false;
+        }, pair.second);
+        
+        if (matches) {
+            globalNodeName = pair.first;
+            break;
+        }
+    }
+    
+    if (globalNodeName.empty()) {
+        return; // Module not found in global nodes
+    }
+    
+    // Get the current positions of all modules/islands
+    std::map<std::string, std::pair<int, int>> nodePositions;
+    for (const auto& pair : model.globalNodes) {
+        std::visit([&](auto&& arg) {
+            using T = std::decay_t<decltype(arg)>;
+            if constexpr (std::is_same_v<T, std::shared_ptr<Module>>) {
+                nodePositions[pair.first] = {arg->getX(), arg->getY()};
+            } else if constexpr (std::is_same_v<T, std::shared_ptr<SymmetryIslandBlock>>) {
+                nodePositions[pair.first] = {arg->getX(), arg->getY()};
+            }
+        }, pair.second);
+    }
+    
+    // Create a restructured tree and optimize based on current positions
+    RestructuredBStarTree newTree;
+    
+    // Add all nodes
+    std::vector<std::shared_ptr<BStarTreeNode>> preorderNodes;
+    collectGlobalNodesPreOrder(model.globalTree, preorderNodes);
+    
+    for (const auto& node : preorderNodes) {
+        auto newNode = std::make_shared<BStarTreeNode>(node->getModuleName());
+        newTree.addNode(newNode);
+    }
+    
+    // Optimize based on current positions
+    newTree.optimizeTreeFromPositions(nodePositions);
+    
+    // Replace the global tree
+    model.globalTree = convertRestructuredTreeToGlobalTree(newTree);
+}
+
+/**
+ * Validates a perturbation move and updates the tree structure if valid
+ * 
+ * @param fromNodeName Name of node to move
+ * @param toNodeName Name of destination parent node
+ * @param asLeftChild True if should be left child
+ * @return True if move was valid and successful
+ */
+bool PlacementSolver::validateAndUpdateTreeStructure(
+    const std::string& fromNodeName, 
+    const std::string& toNodeName,
+    bool asLeftChild) {
+    
+    // Find the nodes in the global tree
+    auto fromNode = findNodeInGlobalTree(model.globalTree, fromNodeName);
+    auto toNode = findNodeInGlobalTree(model.globalTree, toNodeName);
+    
+    if (!fromNode || !toNode) {
+        return false;
+    }
+    
+    // Create restructured tree
+    RestructuredBStarTree restructuredTree;
+    
+    // Add all nodes
+    std::vector<std::shared_ptr<BStarTreeNode>> preorderNodes;
+    collectGlobalNodesPreOrder(model.globalTree, preorderNodes);
+    
+    for (const auto& node : preorderNodes) {
+        auto newNode = std::make_shared<BStarTreeNode>(node->getModuleName());
+        restructuredTree.addNode(newNode);
+    }
+    
+    // Perform the move in the restructured tree
+    auto restructuredFromNode = restructuredTree.findNode(fromNodeName);
+    auto restructuredToNode = restructuredTree.findNode(toNodeName);
+    
+    if (!restructuredFromNode || !restructuredToNode) {
+        return false;
+    }
+    
+    bool success = restructuredTree.moveNode(restructuredFromNode, restructuredToNode, asLeftChild);
+    
+    if (success) {
+        // Update the global tree
+        model.globalTree = convertRestructuredTreeToGlobalTree(restructuredTree);
+    }
+    
+    return success;
+}
+
+/**
+ * Finds a node in the global tree by name
+ * 
+ * @param root Root of the tree
+ * @param nodeName Name to search for
+ * @return Found node or nullptr
+ */
+std::shared_ptr<BStarTreeNode> PlacementSolver::findNodeInGlobalTree(
+    const std::shared_ptr<BStarTreeNode>& root, 
+    const std::string& nodeName) {
+    
+    if (!root) return nullptr;
+    
+    if (root->getModuleName() == nodeName) {
+        return root;
+    }
+    
+    auto leftResult = findNodeInGlobalTree(root->getLeftChild(), nodeName);
+    if (leftResult) {
+        return leftResult;
+    }
+    
+    return findNodeInGlobalTree(root->getRightChild(), nodeName);
 }
 
 bool PlacementSolver::performRandomPerturbation() {

@@ -18,6 +18,7 @@
 #include "../data_struct/Module.hpp"
 #include "../data_struct/SymmetryConstraint.hpp"
 #include "../data_struct/BStarTreeNode.hpp"
+#include "../data_struct/RestructuredBStarTree.hpp"
 #include "../data_struct/ASFBStarTree.hpp"
 #include "../data_struct/SymmetryIslandBlock.hpp"
 #include "../utils/PlacementModel.hpp"
@@ -70,16 +71,30 @@ private:
      * Creates a global B*-tree for overall placement
      */
     void createGlobalBTree();
-    
+
+    std::shared_ptr<BStarTreeNode> convertRestructuredTreeToGlobalTree(const RestructuredBStarTree &restructuredTree);
+
+    void optimizeGlobalTreeStructure();
+
+    void collectGlobalNodesPreOrder(const std::shared_ptr<BStarTreeNode> &node, std::vector<std::shared_ptr<BStarTreeNode>> &nodes);
+
+    void rebuildGlobalTree();
+
+    void updateTreeStructureAfterMovement(const std::string &moduleName);
+
+    bool validateAndUpdateTreeStructure(const std::string &fromNodeName, const std::string &toNodeName, bool asLeftChild);
+
     /**
      * Initializes module grouping
      * Identifies which modules belong to which symmetry groups
      */
     void initializeModuleGrouping();
-    
+
+    std::shared_ptr<BStarTreeNode> findNodeInGlobalTree(const std::shared_ptr<BStarTreeNode> &root, const std::string &nodeName);
+
     /**
      * Performs a random perturbation on the current solution
-     * 
+     *
      * @return True if perturbation succeeded
      */
     bool performRandomPerturbation();

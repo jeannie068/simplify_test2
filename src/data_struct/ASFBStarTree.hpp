@@ -384,6 +384,12 @@ public:
 
     bool enforceConnectivity();
 
+    bool hasContourOverlap(int x, int y, int width, int height);
+
+    void optimizeModulePositions();
+
+    void compactPlacement();
+
     // Backup/restore methods for the tree structure
     void backupTreeStructure() {
         // Store the current tree structure to enable complete restoration

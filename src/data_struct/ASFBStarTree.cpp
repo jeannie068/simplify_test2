@@ -344,8 +344,8 @@ void ASFBStarTree::updateSymmetricModulePositions() {
 
 /**
  * Builds an initial B*-tree optimized for vertical stacking of symmetry pairs
- * This follows the paper's approach more closely by ensuring proper placement
- * of self-symmetric modules and creating a compact tree structure
+ * This follows self-symmetric modules are on the correct branch 
+ * and creating a compact tree structure according to Property 1 from the paper
  */
 void ASFBStarTree::buildInitialBStarTree() {
     Logger::log("Building initial ASF-B*-tree with vertical stacking optimization");
@@ -425,19 +425,16 @@ void ASFBStarTree::buildInitialBStarTree() {
         for (const auto& name : selfSymModules) {
             if (symmetryGroup->getType() == SymmetryType::VERTICAL) {
                 // For vertical symmetry, self-symmetric modules on rightmost branch
+                Logger::log("Placed self-symmetric module " + name + " as right child of " + currentNode->moduleName);
                 currentNode->right = nodeMap[name];
                 currentNode = currentNode->right;
-                Logger::log("Placed self-symmetric module " + name + " as right child of " + currentNode->moduleName);
             } else {
                 // For horizontal symmetry, self-symmetric modules on leftmost branch
+                Logger::log("Placed self-symmetric module " + name + " as left child of " + currentNode->moduleName);
                 currentNode->left = nodeMap[name];
                 currentNode = currentNode->left;
-                Logger::log("Placed self-symmetric module " + name + " as left child of " + currentNode->moduleName);
             }
         }
-        
-        // Reset to root for placing non-self-symmetric modules
-        currentNode = root;
         
         // Now build a chain of nodes that will create a vertical stack
         if (symmetryGroup->getType() == SymmetryType::VERTICAL) {
@@ -449,13 +446,31 @@ void ASFBStarTree::buildInitialBStarTree() {
             for (size_t i = 0; i < nonSelfSymModules.size(); i++) {
                 const std::string& moduleName = nonSelfSymModules[i];
                 
-                if (i == 0 && currentNode == root) {
-                    // Place the first module as right child of root to start stacking
-                    currentNode->right = nodeMap[moduleName];
-                    currentNode = currentNode->right;
+                if (i == 0) {
+                    // For the first module, we need to find the end of the rightmost branch
+                    // to preserve self-symmetric modules
+                    if (root->right == nullptr) {
+                        // Root has no right child, safe to add directly
+                        Logger::log("Placed first non-self-symmetric module " + moduleName + " as right child of root");
+                        root->right = nodeMap[moduleName];
+                        currentNode = root->right;
+                    } else {
+                        // Root already has a right child (self-symmetric module)
+                        // Find the end of the rightmost branch
+                        BStarNode* rightmost = root;
+                        while (rightmost->right != nullptr) {
+                            rightmost = rightmost->right;
+                        }
+                        // Add as right child of the rightmost node
+                        Logger::log("Placed first non-self-symmetric module " + moduleName + 
+                                  " as right child of " + rightmost->moduleName);
+                        rightmost->right = nodeMap[moduleName];
+                        currentNode = rightmost->right;
+                    }
                 } else if (i % 2 == 0) {
                     // Even indices go to right (vertical stacking)
                     if (currentNode->right == nullptr) {
+                        Logger::log("Placed module " + moduleName + " as right child of " + currentNode->moduleName);
                         currentNode->right = nodeMap[moduleName];
                         currentNode = currentNode->right;
                     } else {
@@ -474,6 +489,7 @@ void ASFBStarTree::buildInitialBStarTree() {
                         findOpenRightSlot(root);
                         
                         if (target != nullptr) {
+                            Logger::log("Placed module " + moduleName + " as right child of " + target->moduleName);
                             target->right = nodeMap[moduleName];
                             currentNode = target->right;
                         }
@@ -481,6 +497,7 @@ void ASFBStarTree::buildInitialBStarTree() {
                 } else {
                     // Odd indices go to left (placing to the right side)
                     if (currentNode->left == nullptr) {
+                        Logger::log("Placed module " + moduleName + " as left child of " + currentNode->moduleName);
                         currentNode->left = nodeMap[moduleName];
                         currentNode = currentNode->left;
                     } else {
@@ -499,13 +516,12 @@ void ASFBStarTree::buildInitialBStarTree() {
                         findOpenLeftSlot(root);
                         
                         if (target != nullptr) {
+                            Logger::log("Placed module " + moduleName + " as left child of " + target->moduleName);
                             target->left = nodeMap[moduleName];
                             currentNode = target->left;
                         }
                     }
                 }
-                
-                Logger::log("Placed module " + moduleName + " in the tree");
             }
         } else {
             // For horizontal symmetry, similar but with left/right children swapped
@@ -513,17 +529,82 @@ void ASFBStarTree::buildInitialBStarTree() {
             for (size_t i = 0; i < nonSelfSymModules.size(); i++) {
                 const std::string& moduleName = nonSelfSymModules[i];
                 
-                if (i % 2 == 0) {
+                if (i == 0) {
+                    // For the first module, we need to find the end of the leftmost branch
+                    // to preserve self-symmetric modules
+                    if (root->left == nullptr) {
+                        // Root has no left child, safe to add directly
+                        Logger::log("Placed first non-self-symmetric module " + moduleName + " as left child of root");
+                        root->left = nodeMap[moduleName];
+                        currentNode = root->left;
+                    } else {
+                        // Root already has a left child (self-symmetric module)
+                        // Find the end of the leftmost branch
+                        BStarNode* leftmost = root;
+                        while (leftmost->left != nullptr) {
+                            leftmost = leftmost->left;
+                        }
+                        // Add as left child of the leftmost node
+                        Logger::log("Placed first non-self-symmetric module " + moduleName + 
+                                  " as left child of " + leftmost->moduleName);
+                        leftmost->left = nodeMap[moduleName];
+                        currentNode = leftmost->left;
+                    }
+                } else if (i % 2 == 0) {
                     // Even indices go to left (horizontal arrangement)
-                    currentNode->left = nodeMap[moduleName];
-                    currentNode = currentNode->left;
+                    if (currentNode->left == nullptr) {
+                        Logger::log("Placed module " + moduleName + " as left child of " + currentNode->moduleName);
+                        currentNode->left = nodeMap[moduleName];
+                        currentNode = currentNode->left;
+                    } else {
+                        // Find a node with no left child
+                        BStarNode* target = nullptr;
+                        std::function<void(BStarNode*)> findOpenLeftSlot = [&](BStarNode* node) {
+                            if (node == nullptr) return;
+                            if (node->left == nullptr) {
+                                target = node;
+                                return;
+                            }
+                            findOpenLeftSlot(node->right);
+                            if (target == nullptr) findOpenLeftSlot(node->left);
+                        };
+                        
+                        findOpenLeftSlot(root);
+                        
+                        if (target != nullptr) {
+                            Logger::log("Placed module " + moduleName + " as left child of " + target->moduleName);
+                            target->left = nodeMap[moduleName];
+                            currentNode = target->left;
+                        }
+                    }
                 } else {
                     // Odd indices go to right (vertical offset)
-                    currentNode->right = nodeMap[moduleName];
-                    currentNode = currentNode->right;
+                    if (currentNode->right == nullptr) {
+                        Logger::log("Placed module " + moduleName + " as right child of " + currentNode->moduleName);
+                        currentNode->right = nodeMap[moduleName];
+                        currentNode = currentNode->right;
+                    } else {
+                        // Find a node with no right child
+                        BStarNode* target = nullptr;
+                        std::function<void(BStarNode*)> findOpenRightSlot = [&](BStarNode* node) {
+                            if (node == nullptr) return;
+                            if (node->right == nullptr) {
+                                target = node;
+                                return;
+                            }
+                            findOpenRightSlot(node->left);
+                            if (target == nullptr) findOpenRightSlot(node->right);
+                        };
+                        
+                        findOpenRightSlot(root);
+                        
+                        if (target != nullptr) {
+                            Logger::log("Placed module " + moduleName + " as right child of " + target->moduleName);
+                            target->right = nodeMap[moduleName];
+                            currentNode = target->right;
+                        }
+                    }
                 }
-                
-                Logger::log("Placed module " + moduleName + " in the tree");
             }
         }
     }

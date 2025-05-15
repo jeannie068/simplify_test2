@@ -255,6 +255,13 @@ int PlacementSolver::getContourHeight(int x) {
  * Enhanced buildInitialBStarTree with intelligent node arrangement
  * Replace the existing buildInitialBStarTree in PlacementSolver
  */
+// Fix for buildInitialBStarTree function to prevent creating cycles
+// Enhanced buildInitialBStarTree Implementation for Balanced Tree
+/**
+ * Builds a more balanced B*-tree for global placement
+ * The key improvement is to generate a tree that uses both left and right children
+ * to create a more compact placement
+ */
 void PlacementSolver::buildInitialBStarTree() {
     // Clean up any existing tree
     cleanupBStarTree(bstarRoot);
@@ -265,6 +272,7 @@ void PlacementSolver::buildInitialBStarTree() {
     // Get all module and island names
     std::vector<std::string> entities;
     std::unordered_map<std::string, std::pair<int, int>> entityDimensions;
+    std::unordered_map<std::string, bool> isIslandMap;
     
     // Add symmetry islands
     for (size_t i = 0; i < symmetryIslands.size(); i++) {
@@ -280,6 +288,7 @@ void PlacementSolver::buildInitialBStarTree() {
             symmetryIslands[i]->getWidth(),
             symmetryIslands[i]->getHeight()
         };
+        isIslandMap[name] = true;
         
         logGlobalPlacement("Adding symmetry island: " + name + 
                           " width=" + std::to_string(symmetryIslands[i]->getWidth()) + 
@@ -299,6 +308,7 @@ void PlacementSolver::buildInitialBStarTree() {
             pair.second->getWidth(),
             pair.second->getHeight()
         };
+        isIslandMap[pair.first] = false;
         
         logGlobalPlacement("Adding regular module: " + pair.first + 
                           " width=" + std::to_string(pair.second->getWidth()) + 
@@ -322,104 +332,92 @@ void PlacementSolver::buildInitialBStarTree() {
     // Create nodes for all entities
     std::unordered_map<std::string, BStarNode*> nodeMap;
     for (const auto& name : entities) {
-        bool isIsland = (name.substr(0, 6) == "island");
+        bool isIsland = isIslandMap[name];
         nodeMap[name] = new BStarNode(name, isIsland);
         logGlobalPlacement("Created node for: " + name + " (isIsland: " + 
                           (isIsland ? "true" : "false") + ")");
     }
     
-    // Build B*-tree with enhanced placement strategy
+    // Keep track of nodes already placed as children to prevent multiple parents
+    std::unordered_set<std::string> placedAsChild;
+    
+    // Build a tree using BFS approach for a balanced tree
     if (!entities.empty()) {
         // Start with the first entity as the root
         bstarRoot = nodeMap[entities[0]];
+        placedAsChild.insert(entities[0]);
         logGlobalPlacement("Set root to: " + entities[0]);
         
-        // For smaller problems, create a simple chain-like structure
-        if (entities.size() <= 3) {
-            BStarNode* current = bstarRoot;
-            for (size_t i = 1; i < entities.size(); i++) {
-                // Place the next entity as the right child (stack vertically)
-                current->right = nodeMap[entities[i]];
-                current = current->right;
-                logGlobalPlacement("Placed " + entities[i] + " as right child of " + entities[i-1]);
-            }
-        } else {
-            // For larger problems, use a more balanced approach
-            // First entity is already the root
+        // Queue for BFS traversal
+        std::queue<BStarNode*> nodeQueue;
+        nodeQueue.push(bstarRoot);
+        
+        // Now assign the rest of the entities
+        size_t entityIndex = 1;
+        
+        while (!nodeQueue.empty() && entityIndex < entities.size()) {
+            BStarNode* currentParent = nodeQueue.front();
+            nodeQueue.pop();
             
-            // Place second entity to the right of root (stack vertically)
-            if (entities.size() > 1) {
-                bstarRoot->right = nodeMap[entities[1]];
-                logGlobalPlacement("Placed " + entities[1] + " as right child of " + entities[0]);
-            }
-            
-            // Place third entity to the right of root (place horizontally)
-            if (entities.size() > 2) {
-                bstarRoot->left = nodeMap[entities[2]];
-                logGlobalPlacement("Placed " + entities[2] + " as left child of " + entities[0]);
-            }
-            
-            // For remaining entities, try to alternate between left/right to create
-            // a balanced tree structure
-            for (size_t i = 3; i < entities.size(); i++) {
-                // Find best placement location
-                BStarNode* bestParent = nullptr;
-                std::string childType;
+            // Try to add left child (placed to the right of parent)
+            if (entityIndex < entities.size()) {
+                const std::string& leftChildName = entities[entityIndex++];
+                BStarNode* leftChild = nodeMap[leftChildName];
                 
-                // If this is an odd index, prefer placing to the right of a node
-                if (i % 2 == 1) {
-                    // Find a node with no right child
-                    for (const auto& pair : nodeMap) {
-                        BStarNode* node = pair.second;
-                        // Skip the node we're placing and nodes that already have a right child
-                        if (node == nodeMap[entities[i]] || node->right != nullptr) {
-                            continue;
-                        }
-                        bestParent = node;
-                        childType = "right";
-                        break;
-                    }
-                } else {
-                    // Find a node with no left child
-                    for (const auto& pair : nodeMap) {
-                        BStarNode* node = pair.second;
-                        // Skip the node we're placing, nodes that already have a left child,
-                        // and contour nodes which cannot have left children
-                        if (node == nodeMap[entities[i]] || node->left != nullptr) {
-                            continue;
-                        }
-                        bestParent = node;
-                        childType = "left";
-                        break;
-                    }
-                }
+                currentParent->left = leftChild;
+                placedAsChild.insert(leftChildName);
+                nodeQueue.push(leftChild);
                 
-                // If we found a parent, place the node
-                if (bestParent != nullptr) {
-                    if (childType == "right") {
-                        bestParent->right = nodeMap[entities[i]];
-                    } else {
-                        bestParent->left = nodeMap[entities[i]];
-                    }
-                    logGlobalPlacement("Placed " + entities[i] + " as " + childType + 
-                                     " child of " + bestParent->name);
-                } else {
-                    // Fallback to a simple stack approach
-                    BStarNode* current = bstarRoot;
-                    while (current->right != nullptr) {
-                        current = current->right;
-                    }
-                    current->right = nodeMap[entities[i]];
-                    logGlobalPlacement("Placed " + entities[i] + " as right child of " + 
-                                     current->name + " (fallback)");
+                logGlobalPlacement("Placed " + leftChildName + " as left child of " + currentParent->name);
+            }
+            
+            // Try to add right child (placed on top of parent)
+            if (entityIndex < entities.size()) {
+                const std::string& rightChildName = entities[entityIndex++];
+                BStarNode* rightChild = nodeMap[rightChildName];
+                
+                currentParent->right = rightChild;
+                placedAsChild.insert(rightChildName);
+                nodeQueue.push(rightChild);
+                
+                logGlobalPlacement("Placed " + rightChildName + " as right child of " + currentParent->name);
+            }
+        }
+        
+        // Check if all entities were placed
+        if (placedAsChild.size() != entities.size()) {
+            logGlobalPlacement("WARNING: Not all entities were placed in the tree!");
+            
+            // This should never happen with BFS, but let's add a safety check
+            for (const auto& entity : entities) {
+                if (placedAsChild.find(entity) == placedAsChild.end()) {
+                    logGlobalPlacement("Entity not placed: " + entity);
                 }
             }
         }
     }
     
-    // Log tree structure
+    // Log the final tree structure
     logGlobalPlacement("Final B*-tree structure:");
     printBStarTree(bstarRoot, "", true);
+    
+    // Do a final validation to make sure the tree is well-formed
+    if (!validateBStarTree()) {
+        logGlobalPlacement("WARNING: Initial B*-tree validation failed. The tree may have structural issues.");
+    } else {
+        // Log how many nodes are in the tree
+        size_t totalNodes = 0;
+        std::function<void(BStarNode*)> countNodes = [&](BStarNode* n) {
+            if (n == nullptr) return;
+            totalNodes++;
+            countNodes(n->left);
+            countNodes(n->right);
+        };
+        countNodes(bstarRoot);
+        
+        logGlobalPlacement("Tree building complete: " + std::to_string(totalNodes) + 
+                          " nodes out of " + std::to_string(entities.size()) + " entities");
+    }
 }
 
 
@@ -477,12 +475,28 @@ PlacementSolver::BStarNode* PlacementSolver::findNodeByName(const std::string& n
     return find(bstarRoot);
 }
 
+// Fixed packBStarTree function to properly handle BFS traversal
+/**
+ * Pack the B*-tree to get the coordinates of all modules and islands
+ * Ensures proper traversal of the tree structure to place all modules
+ */
 void PlacementSolver::packBStarTree() {
     // Clear the contour
     clearContour();
     
     if (globalDebugEnabled) {
         logGlobalPlacement("======== PACKING GLOBAL B*-TREE ========");
+        logContour();
+    }
+    
+    // Validate tree structure before packing
+    if (!validateBStarTree()) {
+        logGlobalPlacement("ERROR: Invalid tree structure detected before packing. Attempting to rebuild tree.");
+        buildInitialBStarTree();
+        if (!validateBStarTree()) {
+            logGlobalPlacement("CRITICAL ERROR: Still unable to build a valid tree. Aborting packing.");
+            return;
+        }
     }
     
     // Initialize node positions
@@ -490,8 +504,13 @@ void PlacementSolver::packBStarTree() {
     
     // Use level-order traversal (BFS) to ensure parents are processed before children
     std::queue<BStarNode*> bfsQueue;
+    // Track visited nodes to prevent processing the same node twice
+    std::unordered_set<BStarNode*> visited;
+    
     if (bstarRoot != nullptr) {
         bfsQueue.push(bstarRoot);
+        visited.insert(bstarRoot);
+        
         // Root is placed at (0,0)
         nodePositions[bstarRoot] = {0, 0};
         
@@ -504,6 +523,10 @@ void PlacementSolver::packBStarTree() {
                 updateContour(0, 0, 
                              symmetryIslands[islandIndex]->getWidth(), 
                              symmetryIslands[islandIndex]->getHeight());
+                
+                logGlobalPlacement("Placed root (island_" + std::to_string(islandIndex) + ") at (0,0)");
+            } else {
+                logGlobalPlacement("ERROR: Invalid island index for root: " + bstarRoot->name);
             }
         } else {
             // Regular module
@@ -512,6 +535,10 @@ void PlacementSolver::packBStarTree() {
                 updateContour(0, 0, 
                              regularModules[bstarRoot->name]->getWidth(), 
                              regularModules[bstarRoot->name]->getHeight());
+                
+                logGlobalPlacement("Placed root (" + bstarRoot->name + ") at (0,0)");
+            } else {
+                logGlobalPlacement("ERROR: Root module not found: " + bstarRoot->name);
             }
         }
     }
@@ -520,14 +547,18 @@ void PlacementSolver::packBStarTree() {
     int maxX = 0;
     int maxY = 0;
     
+    // Process the queue
     while (!bfsQueue.empty()) {
         BStarNode* node = bfsQueue.front();
         bfsQueue.pop();
         
         // Skip null nodes
         if (!node) {
+            logGlobalPlacement("WARNING: Encountered null node in BFS queue");
             continue;
         }
+        
+        logGlobalPlacement("Processing node: " + node->name);
         
         // Get current node position
         int nodeX = nodePositions[node].first;
@@ -543,6 +574,9 @@ void PlacementSolver::packBStarTree() {
             if (islandIndex < symmetryIslands.size() && symmetryIslands[islandIndex]) {
                 width = symmetryIslands[islandIndex]->getWidth();
                 height = symmetryIslands[islandIndex]->getHeight();
+            } else {
+                logGlobalPlacement("ERROR: Invalid symmetry island: " + node->name);
+                continue;
             }
         } else {
             // Regular module
@@ -550,6 +584,9 @@ void PlacementSolver::packBStarTree() {
                 regularModules[node->name]) {
                 width = regularModules[node->name]->getWidth();
                 height = regularModules[node->name]->getHeight();
+            } else {
+                logGlobalPlacement("ERROR: Regular module not found: " + node->name);
+                continue;
             }
         }
         
@@ -558,12 +595,18 @@ void PlacementSolver::packBStarTree() {
         maxY = std::max(maxY, nodeY + height);
         
         // Process left child (placed to the right of current node)
-        if (node->left) {
+        if (node->left && visited.find(node->left) == visited.end()) {
             int leftX = nodeX + width;
-            int leftY = getContourHeight(leftX);
+            int leftY = nodeY;
+            
+            // Log before placing
+            logGlobalPlacement("Placing left child " + node->left->name + 
+                              " at (" + std::to_string(leftX) + "," + 
+                              std::to_string(leftY) + ")");
             
             // Store position of left child
             nodePositions[node->left] = {leftX, leftY};
+            visited.insert(node->left);
             
             // Update module/island position
             if (node->left->isSymmetryIsland) {
@@ -574,6 +617,8 @@ void PlacementSolver::packBStarTree() {
                     updateContour(leftX, leftY, 
                                  symmetryIslands[islandIndex]->getWidth(), 
                                  symmetryIslands[islandIndex]->getHeight());
+                } else {
+                    logGlobalPlacement("ERROR: Invalid symmetry island for left child: " + node->left->name);
                 }
             } else {
                 // Regular module
@@ -583,20 +628,31 @@ void PlacementSolver::packBStarTree() {
                     updateContour(leftX, leftY, 
                                  regularModules[node->left->name]->getWidth(), 
                                  regularModules[node->left->name]->getHeight());
+                } else {
+                    logGlobalPlacement("ERROR: Regular module not found for left child: " + node->left->name);
                 }
             }
             
             // Add to queue for further processing
             bfsQueue.push(node->left);
+        } else if (node->left) {
+            logGlobalPlacement("WARNING: Left child " + node->left->name + 
+                              " has already been visited (cycle detected)");
         }
         
         // Process right child (placed at same x, above current node)
-        if (node->right) {
+        if (node->right && visited.find(node->right) == visited.end()) {
             int rightX = nodeX;
             int rightY = nodeY + height;
             
+            // Log before placing
+            logGlobalPlacement("Placing right child " + node->right->name + 
+                              " at (" + std::to_string(rightX) + "," + 
+                              std::to_string(rightY) + ")");
+            
             // Store position of right child
             nodePositions[node->right] = {rightX, rightY};
+            visited.insert(node->right);
             
             // Update module/island position
             if (node->right->isSymmetryIsland) {
@@ -607,6 +663,8 @@ void PlacementSolver::packBStarTree() {
                     updateContour(rightX, rightY, 
                                  symmetryIslands[islandIndex]->getWidth(), 
                                  symmetryIslands[islandIndex]->getHeight());
+                } else {
+                    logGlobalPlacement("ERROR: Invalid symmetry island for right child: " + node->right->name);
                 }
             } else {
                 // Regular module
@@ -616,19 +674,51 @@ void PlacementSolver::packBStarTree() {
                     updateContour(rightX, rightY, 
                                  regularModules[node->right->name]->getWidth(), 
                                  regularModules[node->right->name]->getHeight());
+                } else {
+                    logGlobalPlacement("ERROR: Regular module not found for right child: " + node->right->name);
                 }
             }
             
             // Add to queue for further processing
             bfsQueue.push(node->right);
+        } else if (node->right) {
+            logGlobalPlacement("WARNING: Right child " + node->right->name + 
+                              " has already been visited (cycle detected)");
+        }
+        
+        // Log the current contour
+        if (globalDebugEnabled) {
+            logContour();
         }
     }
+    
+    // Count how many nodes were visited vs how many should be in the tree
+    size_t totalNodes = 0;
+    std::function<void(BStarNode*)> countNodes = [&](BStarNode* n) {
+        if (n == nullptr) return;
+        totalNodes++;
+        countNodes(n->left);
+        countNodes(n->right);
+    };
+    countNodes(bstarRoot);
+    
+    logGlobalPlacement("Visited " + std::to_string(visited.size()) + " nodes out of " + 
+                      std::to_string(totalNodes) + " total nodes in tree");
+    
+    // Log the resulting bounding box
+    logGlobalPlacement("Final bounding box: (" + std::to_string(maxX) + "," + 
+                      std::to_string(maxY) + ") with area " + std::to_string(maxX * maxY));
     
     // Update traversal lists with names instead of pointers
     preorderNodeNames.clear();
     inorderNodeNames.clear();
     safePreorder(bstarRoot);
     safeInorder(bstarRoot);
+    
+    // Do a final validation to ensure the tree remains valid after packing
+    if (!validateBStarTree()) {
+        logGlobalPlacement("WARNING: Tree validation failed after packing.");
+    }
 }
 
 // Calculate bounding box area
@@ -948,20 +1038,40 @@ bool PlacementSolver::convertSymmetryType() {
 }
 
 // Added tree validation for PlacementSolver
+/**
+ * Improved validation function to better identify issues
+ */
 bool PlacementSolver::validateBStarTree() {
     if (bstarRoot == nullptr) return true;
+    
+    logGlobalPlacement("Validating tree structure...");
     
     // Set to keep track of visited nodes
     std::unordered_set<BStarNode*> visited;
     
+    // Set to track node parents (to check for multiple parents issue)
+    std::unordered_map<BStarNode*, BStarNode*> parentMap;
+    
     // Function to check for cycles in the tree
-    std::function<bool(BStarNode*, std::unordered_set<BStarNode*>&)> hasNoCycles =
-        [&](BStarNode* current, std::unordered_set<BStarNode*>& path) -> bool {
+    std::function<bool(BStarNode*, BStarNode*, std::unordered_set<BStarNode*>&)> hasNoCycles =
+        [&](BStarNode* current, BStarNode* parent, std::unordered_set<BStarNode*>& path) -> bool {
             if (current == nullptr) return true;
             
             // If we've seen this node in the current path, we have a cycle
             if (path.find(current) != path.end()) {
+                logGlobalPlacement("CYCLE DETECTED at node: " + current->name);
                 return false;
+            }
+            
+            // Check if this node already has a different parent (multiple parents issue)
+            if (parentMap.find(current) != parentMap.end()) {
+                if (parentMap[current] != parent && parent != nullptr) {
+                    logGlobalPlacement("MULTIPLE PARENTS DETECTED for node: " + current->name + 
+                                      " (Parents: " + parentMap[current]->name + " and " + parent->name + ")");
+                    return false;
+                }
+            } else if (parent != nullptr) {
+                parentMap[current] = parent;
             }
             
             // Add this node to the current path
@@ -969,8 +1079,8 @@ bool PlacementSolver::validateBStarTree() {
             visited.insert(current);
             
             // Check children
-            bool leftValid = hasNoCycles(current->left, path);
-            bool rightValid = hasNoCycles(current->right, path);
+            bool leftValid = hasNoCycles(current->left, current, path);
+            bool rightValid = hasNoCycles(current->right, current, path);
             
             // Remove this node from the current path (backtracking)
             path.erase(current);
@@ -980,7 +1090,12 @@ bool PlacementSolver::validateBStarTree() {
     
     // Start DFS from the root to check for cycles
     std::unordered_set<BStarNode*> path;
-    bool noCycles = hasNoCycles(bstarRoot, path);
+    bool noCycles = hasNoCycles(bstarRoot, nullptr, path);
+    
+    if (!noCycles) {
+        logGlobalPlacement("Tree validation FAILED: Cycles detected");
+        return false;
+    }
     
     // Make sure each node in the tree is reachable from the root
     // First count all nodes in the tree
@@ -993,8 +1108,49 @@ bool PlacementSolver::validateBStarTree() {
     };
     countNodes(bstarRoot);
     
+    logGlobalPlacement("Total nodes in tree: " + std::to_string(totalNodes));
+    logGlobalPlacement("Visited nodes during validation: " + std::to_string(visited.size()));
+    
     // Make sure we visited all nodes in the cycle check
-    return noCycles && (visited.size() == totalNodes);
+    if (visited.size() != totalNodes) {
+        logGlobalPlacement("Tree validation FAILED: Not all nodes are reachable from root");
+        return false;
+    }
+    
+    // Verify that all nodes in the tree reference valid modules/islands
+    std::function<bool(BStarNode*)> verifyEntitiesExist = [&](BStarNode* n) -> bool {
+        if (n == nullptr) return true;
+        
+        if (n->isSymmetryIsland) {
+            // Check if island exists
+            try {
+                size_t islandIndex = std::stoi(n->name.substr(7));
+                if (islandIndex >= symmetryIslands.size() || !symmetryIslands[islandIndex]) {
+                    logGlobalPlacement("Tree validation FAILED: Node " + n->name + " references invalid symmetry island");
+                    return false;
+                }
+            } catch (const std::exception& e) {
+                logGlobalPlacement("Tree validation FAILED: Invalid island name format: " + n->name);
+                return false;
+            }
+        } else {
+            // Check if module exists
+            if (regularModules.find(n->name) == regularModules.end() || !regularModules[n->name]) {
+                logGlobalPlacement("Tree validation FAILED: Node " + n->name + " references invalid regular module");
+                return false;
+            }
+        }
+        
+        return verifyEntitiesExist(n->left) && verifyEntitiesExist(n->right);
+    };
+    
+    bool entitiesValid = verifyEntitiesExist(bstarRoot);
+    if (!entitiesValid) {
+        return false;
+    }
+    
+    logGlobalPlacement("Tree validation PASSED: Valid tree structure with " + std::to_string(totalNodes) + " nodes");
+    return true;
 }
 
 // Methods for backing up and restoring B*-tree structure in PlacementSolver

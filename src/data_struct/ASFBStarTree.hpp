@@ -382,8 +382,6 @@ public:
 
     bool validateConnectivity();
 
-    bool enforceConnectivity();
-
     bool hasContourOverlap(int x, int y, int width, int height);
 
     void optimizeModulePositions();

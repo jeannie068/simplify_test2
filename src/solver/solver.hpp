@@ -24,7 +24,7 @@
  */
 class PlacementSolver {
 public:
-    // Problem data
+    // Input data
     std::map<std::string, std::shared_ptr<Module>> modules;
     std::vector<std::shared_ptr<SymmetryGroup>> symmetryGroups;
     
@@ -60,6 +60,14 @@ public:
     
     BStarTreeBackup bstarTreeBackup;
     BStarTreeBackup bestBStarTreeBackup;
+
+    // Logger members
+    std::ofstream globalLogFile;
+    bool globalDebugEnabled;
+    void initGlobalDebugger();
+    void logGlobalPlacement(const std::string& message);
+    void logContour();
+    void printBStarTree(BStarNode *node, std::string prefix, bool isLast);
     
     // Current solution
     std::map<std::string, std::shared_ptr<Module>> solutionModules;
@@ -110,6 +118,14 @@ public:
     // Preorder and inorder traversals for B*-tree
     std::vector<BStarNode*> preorderTraversal;
     std::vector<BStarNode*> inorderTraversal;
+    // Use vectors of names instead of pointers for safer traversals
+    std::vector<std::string> preorderNodeNames;
+    std::vector<std::string> inorderNodeNames;
+    
+    // Safe traversal methods
+    void safePreorder(BStarNode* node);
+    void safeInorder(BStarNode* node);
+    BStarNode* findNodeByName(const std::string& name);
     
     /**
      * Cleans up the B*-tree
@@ -159,6 +175,7 @@ public:
      * @param node The current node
      */
     void inorder(BStarNode* node);
+    
     
     /**
      * Packs the B*-tree to get the coordinates of all modules and islands
@@ -269,6 +286,7 @@ public:
     void restoreBestSolution();
     
 public:
+
     /**
      * Constructor
      */
